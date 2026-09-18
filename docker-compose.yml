@@ -1,0 +1,156 @@
+services:
+  # ============================================
+  # PostgreSQL - 业务数据库 + 向量存储(pgvector)
+  # ============================================
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: bubble-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: bubble
+      POSTGRES_PASSWORD: bubble123
+      POSTGRES_DB: bubble
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bubble"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ============================================
+  # Neo4j - 知识图谱
+  # ============================================
+  neo4j:
+    image: neo4j:5.26
+    container_name: bubble-neo4j
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      NEO4J_AUTH: neo4j/bubbleneo4j
+      NEO4J_server_memory_heap_max__size: 1G
+    volumes:
+      - neo4j_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  # ============================================
+  # Redis - 缓存 + Celery Broker
+  # ============================================
+  redis:
+    image: redis:7-alpine
+    container_name: bubble-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ============================================
+  # 后端 API(FastAPI + uvicorn)
+  # ============================================
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+      args:
+        UV_IMAGE: ${UV_IMAGE:-ghcr.io/astral-sh/uv:python3.13-bookworm-slim}
+    container_name: bubble-api
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      BACKGROUND_MODE: celery
+      POSTGRES_HOST: postgres
+      NEO4J_URI: bolt://neo4j:7687
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+      - neo4j
+      - redis
+    restart: unless-stopped
+
+  # ============================================
+  # 前端(构建后由 nginx 托管,/api 反代到 api)
+  # ============================================
+  web:
+    build:
+      context: ./web
+      args:
+        NODE_IMAGE: ${NODE_IMAGE:-node:20-alpine}
+        NGINX_IMAGE: ${NGINX_IMAGE:-nginx:alpine}
+    container_name: bubble-web
+    ports:
+      - "5173:80"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  # ============================================
+  # Celery worker:后台任务(兴趣抽取 / 情绪分析 / 会话摘要 / 洞察刷新)
+  # ============================================
+  worker:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+      args:
+        UV_IMAGE: ${UV_IMAGE:-ghcr.io/astral-sh/uv:python3.13-bookworm-slim}
+    container_name: bubble-worker
+    command: celery -A app.celery_app worker -l info --concurrency=2
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      BACKGROUND_MODE: celery
+      POSTGRES_HOST: postgres
+      NEO4J_URI: bolt://neo4j:7687
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+    depends_on:
+      - postgres
+      - neo4j
+      - redis
+    restart: unless-stopped
+
+  # ============================================
+  # Celery beat:定时任务(每天 04:00 社区全量重聚类 / 04:30 洞察刷新)
+  # ============================================
+  beat:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+      args:
+        UV_IMAGE: ${UV_IMAGE:-ghcr.io/astral-sh/uv:python3.13-bookworm-slim}
+    container_name: bubble-beat
+    command: celery -A app.celery_app beat -l info -s /tmp/celerybeat-schedule
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      BACKGROUND_MODE: celery
+      POSTGRES_HOST: postgres
+      NEO4J_URI: bolt://neo4j:7687
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+    depends_on:
+      - redis
+    restart: unless-stopped
+volumes:
+  pg_data:
+  neo4j_data:
+  redis_data:

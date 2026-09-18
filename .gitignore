@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+.venv/
+venv/
+
+# 环境变量 (包含密钥)
+.env
+
+# Node
+node_modules/
+web/dist/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude
+.claude/
+
+# 临时脚本 / 验收产物
+_staging/
+
+# 运行产物
+api/results/
+*.log
+.pytest_cache/
+.ruff_cache/
+.coverage
+
+# 前端本地环境
+web/.env.local
+
+# 内部文档(交接/进度/简历/调研/改进方案),不随仓库发布
+# 如需公开某篇,把下面两行的注释打开并改成对应文件名
+# docs/*
+# !docs/INTEREST_GRAPH_DESIGN.md
+docs/
+
+# 协作约定(我们内部用)
+AGENTS.md
