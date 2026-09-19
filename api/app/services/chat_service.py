@@ -206,7 +206,6 @@ class ChatService:
             self._pending_user_text,
             conversation_id,
             self._pending_message_id,
-            self._interest_tasks,
         )
 
     async def _auto_save_memory(self, intent, tool_events: list) -> str:
