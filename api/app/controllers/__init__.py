@@ -8,6 +8,7 @@ from . import memory_controller
 from . import mcp_controller
 from . import interest_controller
 from . import emotion_controller
+from . import review_controller
 
 # 注册各模块路由
 api_router.include_router(health_controller.router)
@@ -19,3 +20,4 @@ api_router.include_router(memory_controller.router)
 api_router.include_router(mcp_controller.router)
 api_router.include_router(interest_controller.router)
 api_router.include_router(emotion_controller.router)
+api_router.include_router(review_controller.router)

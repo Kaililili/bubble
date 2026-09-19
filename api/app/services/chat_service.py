@@ -68,7 +68,7 @@ class ChatService:
 
         config = await get_default_config(self.session, user_id, "chat")
         model = build_chat_model(config)
-        tools = await build_enabled_tools(self.session, user_id)
+        tools = await build_enabled_tools(self.session, user_id, conversation_id)
         supports = bool(config.supports_function_call)
 
         # 先读历史(不含当前消息):只取最近一屏,更早的部分由滚动摘要代替

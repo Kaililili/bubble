@@ -34,6 +34,11 @@ celery_app.conf.update(
     broker_connection_retry_on_startup=True,
     # 定时任务
     beat_schedule={
+        # 每周日 21:00 给近 7 天有活动的用户生成个人回顾(Plan-Execute)
+        "weekly-review": {
+            "task": "review.weekly",
+            "schedule": crontab(day_of_week=0, hour=21, minute=0),
+        },
         "insight-refresh-daily": {
             "task": "memory.refresh_all_insights",
             "schedule": crontab(hour=4, minute=30),
@@ -50,3 +55,4 @@ from .tasks import emotion as _emotion_tasks  # noqa: E402,F401
 from .tasks import interest as _interest_tasks  # noqa: E402,F401
 from .tasks import maintenance as _maintenance_tasks  # noqa: E402,F401
 from .tasks import memory as _memory_tasks  # noqa: E402,F401
+from .tasks import review as _review_tasks  # noqa: E402,F401

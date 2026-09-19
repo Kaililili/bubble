@@ -15,6 +15,12 @@ from .interest import (
     VERSION as INTEREST_VERSION,
 )
 from .ontology import ENTITY_TYPES, RELATION_TYPES
+from .review import (
+    ANALYZE_PROMPT as REVIEW_ANALYZE_PROMPT,
+    COMPOSE_PROMPT as REVIEW_COMPOSE_PROMPT,
+    PLAN_PROMPT as REVIEW_PLAN_PROMPT,
+    VERSION as REVIEW_VERSION,
+)
 from .memory import (
     REFLECT_PROMPT,
     SUMMARY_PROMPT,
@@ -33,6 +39,9 @@ PROMPT_REGISTRY: dict[str, str] = {
     "memory.summary": MEMORY_VERSION,
     "memory.reflect": MEMORY_VERSION,
     "memory.supersede": MEMORY_VERSION,
+    "review.plan": REVIEW_VERSION,
+    "review.analyze": REVIEW_VERSION,
+    "review.compose": REVIEW_VERSION,
 }
 
 __all__ = [
@@ -44,6 +53,9 @@ __all__ = [
     "EXTRACT_SYSTEM_PROMPT",
     "PROMPT_REGISTRY",
     "REFLECT_PROMPT",
+    "REVIEW_ANALYZE_PROMPT",
+    "REVIEW_COMPOSE_PROMPT",
+    "REVIEW_PLAN_PROMPT",
     "SUMMARY_PROMPT",
     "SUPERSEDE_PROMPT",
     "build_emotion_prompt",

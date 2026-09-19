@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 from ..base import ToolContext, register_tool
 from . import memory_tools  # noqa: F401  触发记忆工具注册
 from . import interest_tools  # noqa: F401  触发兴趣检索工具注册
+from . import review_tools  # noqa: F401  触发个人回顾(Plan-Execute)工具注册
 
 
 class GetCurrentTimeArgs(BaseModel):
