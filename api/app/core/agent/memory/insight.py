@@ -271,26 +271,3 @@ async def refresh_insights(session, user_id, model=None, force: bool = False) ->
     await upsert_insights(session, user_id, insights)
     logger.info("insights refreshed: %d items", len(insights))
     return len(insights)
-
-
-async def run_insight_task(user_id) -> None:
-    """后台入口:独立 session,异常只记日志"""
-    from app.db.postgres import async_session
-
-    try:
-        async with async_session() as session:
-            await refresh_insights(session, user_id)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("insight task failed: %s", exc)
-
-
-def schedule_insight_refresh(user_id, task_set=None) -> None:
-    """在事件循环里派发一次后台洞察刷新(聊天回复结束后调用)"""
-    import asyncio
-
-    if user_id is None:
-        return
-    task = asyncio.create_task(run_insight_task(user_id))
-    if task_set is not None:
-        task_set.add(task)
-        task.add_done_callback(task_set.discard)

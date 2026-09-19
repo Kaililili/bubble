@@ -34,8 +34,6 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     celery_broker_url: str = "redis://localhost:6379/1"
     celery_result_backend: str = "redis://localhost:6379/2"
-    # 后台任务模式:inline(进程内 asyncio,本地开发默认)/ celery(进 Redis 队列,进程重启不丢)
-    background_mode: str = "inline"
     celery_timezone: str = "Asia/Shanghai"
 
     # 兴趣抽取批处理:攒够 N 条 或 静默 M 秒触发一次(设为 1 即关闭批处理,逐条抽取)

@@ -48,15 +48,12 @@
 | 存储 | PostgreSQL + pgvector(业务与向量)· Neo4j(实体关系图)· Redis(缓存/队列) |
 | 前端 | React 18 · TypeScript · Vite · Ant Design · ECharts · AntV X6 |
 | 模型接入 | 兼容 OpenAI 协议的多 provider(chat / embedding / rerank),按用户配置动态构建客户端 |
-| 异步 | Celery(Redis 队列)+ 定时任务:兴趣抽取 / 情绪分析 / 会话摘要 / 洞察刷新;本地开发可切回进程内 inline 模式 |
-
-**异步设计**:聊天主链路只做「读上下文 → 调模型 → 流式返回」;兴趣、情绪、摘要、洞察都在**回复结束后**由后台任务完成(队列模式可重试、进程重启不丢,见 FAQ),
+| 异步 | Celery(Redis 队列)+ beat 定时任务:兴趣抽取 / 情绪分析 / 会话摘要 / 洞察刷新 |
 
 ## 环境要求
 
 - Docker + Docker Compose(推荐用于存储与一键部署)
-- 本机开发:[uv](https://docs.astral.sh/uv/)(会自动装 Python 3.13,不用自己装)+ Node.js 20+
-- 只需要一个能跑 `python` 的解释器来生成密钥(脚本只用标准库);没装也可以让 uv 代跑
+- 本机开发:[uv](https://docs.astral.sh/uv/) + Node.js 20+
 
 ## 快速开始
 
@@ -66,28 +63,14 @@
 git clone https://github.com/Kaililili/bubble.git
 cd bubble
 
-# 1) 建 .env(Windows PowerShell 用:Copy-Item .env.example .env)
-cp .env.example .env
-
-# 2) 生成 JWT_SECRET / FERNET_KEY 并写入 .env
-#    脚本只用标准库,任何 Python 3 都能跑;没装 Python 就用 uv 代跑(见下)
-python api/gen_keys.py --write
-
-# 3) 起 7 个容器:postgres / neo4j / redis / api / web / worker / beat
-docker compose up -d --build
-docker compose ps                # 7 个服务都是 Up 就绪
-# 建表/补列/向量索引在服务启动时自动完成,无需手动初始化
+cp .env.example .env           
+python api/gen_keys.py --write 
+docker compose up -d --build    
 ```
 
-没装 Python 时的两种替代(任选一种):
-
-```bash
-py api/gen_keys.py --write                              # Windows 自带 py 启动器
-uv run --no-project python api/gen_keys.py --write      # 用 uv 临时拉一个 Python,不装依赖
-python3 api/gen_keys.py --write                         # macOS / Linux
-```
-
-去掉 `--write` 只打印结果,自己贴进 `.env` 也可以。
+> 没有 `python` 命令时用 `py api/gen_keys.py --write`(Windows)或
+> `uv run --no-project python api/gen_keys.py --write`;去掉 `--write` 只打印结果。
+> 首次启动会自动建表、补列、建向量索引,不需要手动初始化。
 
 > 国内网络:Docker Hub / ghcr.io 拉不动时,在 `.env` 里取消对应行的注释换镜像源
 > (`api` / `worker` / `beat` 三个镜像都基于 `UV_IMAGE`):
@@ -103,32 +86,29 @@ python3 api/gen_keys.py --write                         # macOS / Linux
 ### 方式 B:本机开发
 
 ```bash
-# 1) 只起存储(Docker Desktop 要先启动)
+# 1) 只起存储
 docker compose up -d postgres neo4j redis
 
-# 2) 后端:第一次先建 .env 与密钥(仓库根的 .env 提供配置)
-cp .env.example .env            # Windows PowerShell:Copy-Item .env.example .env
+# 2) 后端(首次先建 .env 和密钥)
+cp .env.example .env
 python api/gen_keys.py --write
-
 uv sync
 cd api
-uv run python run.py            # http://localhost:8000(启动时自动建表/补列/建索引)
-# Windows 也可以直接:.venv\Scripts\python.exe run.py
-# (中文控制台先执行 $env:PYTHONIOENCODING='utf-8')
+uv run python run.py            # http://localhost:8000
 
 # 3) 前端
 cd ../web
 npm install
-npm run dev                     # http://localhost:5173,/api 代理到 8000
+npm run dev                     # http://localhost:5173
 
-# 4) 后台任务(可选):默认进程内 inline,不需要 worker;
-#    想让兴趣/情绪/摘要/洞察进队列,另开一个终端在 api/ 下:
-# uv run celery -A app.celery_app worker --pool=solo -l info   # Windows 必须 --pool=solo
-# uv run celery -A app.celery_app beat -l info                 # 定时任务
+# 4) 后台任务 worker(另开一个终端):兴趣/情绪/摘要/洞察靠它消费队列
+cd ../api
+uv run celery -A app.celery_app worker --pool=solo -l info
 ```
 
-> 依赖声明在**仓库根目录**的 `pyproject.toml`,`.venv` 也建在根目录;在 `api/` 下执行 `uv sync`/`uv run` 也可以(uv 会向上找到项目)。
-> 跑 `uv run <命令>` 就不用管虚拟环境路径了;直接调用解释器则是 `.venv\Scripts\python.exe`(Windows)。
+> Windows 也可以直接跑 `.venv\Scripts\python.exe run.py`(中文控制台先设 `$env:PYTHONIOENCODING='utf-8'`)。
+> 需要定时任务(每天 04:00 社区重聚类、04:30 洞察刷新)再开一个终端跑
+> `uv run celery -A app.celery_app beat -l info`,只跑一个实例。
 
 ## 首次使用流程
 
@@ -143,33 +123,14 @@ npm run dev                     # http://localhost:5173,/api 代理到 8000
 
 **配置在哪里改?**
 
-- **部署类**(端口、数据库连接、要不要用任务队列):仓库根的 `.env`,模板见 `.env.example`,
+- **部署类**(端口、数据库连接、Redis/Neo4j 地址):仓库根的 `.env`,模板见 `.env.example`,
   改完 `docker compose up -d` 重启生效。
 - **应用类**(模型 API Key、MCP 服务、工具开关):界面里的「设置」页,按用户保存、Key 加密落库,不用改代码。
-
-**`JWT_SECRET` 和 `FERNET_KEY` 是干什么的?**
-
-| 变量 | 作用 | 更换后果 |
-|---|---|---|
-| `JWT_SECRET` | 登录 token 的签名密钥 | 已登录用户需要重新登录,**数据无影响** |
-| `FERNET_KEY` | 加密库里的敏感值(模型 API Key、MCP token) | **旧密文解不开**:这些 Key 要在界面上重填一遍 |
-
-生成命令见「快速开始」;两个值都写在仓库根的 `.env`,不会提交到仓库。
-因为是**对称加密**,`FERNET_KEY` 一旦用于加密就不要再换。
 
 **没配置模型能用吗?**
 
 能。没配 embedding 时,记忆与兴趣检索降级为关键词匹配;没配 websearch 时搜索工具会提示先去配置。
 都不影响聊天主链路。
-
-**后台任务需要额外启动吗?**
-
-不需要。本地开发默认 `inline`(回复结束后进程内异步执行);Docker 一键启动会自动带上 `worker` / `beat`。
-想让任务进 Redis 队列(进程重启不丢、失败自动重试),把 `.env` 的 `BACKGROUND_MODE` 设为 `celery`。
-
-**Neo4j / Redis 挂了会怎样?**
-
-不会拖垮聊天:兴趣检索降级为 PostgreSQL 的向量/关键词召回,后台任务只记 warning。
 
 **支持哪些模型?**
 

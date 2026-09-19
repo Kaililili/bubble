@@ -63,14 +63,3 @@ async def summarize_conversation(session, conversation_id, model=None) -> str | 
     )
     logger.info("conversation %s summarized: %d messages", conversation_id, len(pending))
     return summary
-
-
-async def run_summary_task(conversation_id) -> None:
-    """后台入口:独立 session,异常只记日志"""
-    from app.db.postgres import async_session
-
-    try:
-        async with async_session() as session:
-            await summarize_conversation(session, conversation_id)
-    except Exception as e:  # noqa: BLE001
-        logger.warning("conversation summary task failed: %s", e)

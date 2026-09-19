@@ -69,7 +69,6 @@ services:
       - path: .env
         required: false
     environment:
-      BACKGROUND_MODE: celery
       POSTGRES_HOST: postgres
       NEO4J_URI: bolt://neo4j:7687
       REDIS_URL: redis://redis:6379/0
@@ -114,7 +113,6 @@ services:
       - path: .env
         required: false
     environment:
-      BACKGROUND_MODE: celery
       POSTGRES_HOST: postgres
       NEO4J_URI: bolt://neo4j:7687
       REDIS_URL: redis://redis:6379/0
@@ -141,7 +139,6 @@ services:
       - path: .env
         required: false
     environment:
-      BACKGROUND_MODE: celery
       POSTGRES_HOST: postgres
       NEO4J_URI: bolt://neo4j:7687
       REDIS_URL: redis://redis:6379/0

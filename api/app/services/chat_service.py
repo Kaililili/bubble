@@ -37,8 +37,6 @@ class ChatService:
         self._pending_user_text = ""
         self._pending_message_id = None
         self._pending_context: list[str] = []
-        self._interest_tasks: set = set()
-        self._emotion_tasks: set = set()
 
     async def _load_profile_block(self, user_id: UUID) -> str:
         """加载用户背景,拼成固定格式文本;超长按 importance 从高到低截断"""
@@ -133,7 +131,7 @@ class ChatService:
         return model, tools, supports, history, conversation_id
 
     async def _schedule_interest_extraction(self, conversation_id: UUID) -> None:
-        """回复结束后派发兴趣抽取:celery 模式进队列(重启不丢),inline 模式走进程内任务"""
+        """回复结束后派发兴趣抽取:投递到 Celery 队列,由 worker 消费(进程重启不丢)"""
         from ..tasks import dispatch
 
         await dispatch.enqueue_interest(
@@ -142,15 +140,14 @@ class ChatService:
             conversation_id,
             self._pending_message_id,
             self._pending_context,
-            self._interest_tasks,
         )
 
     def _schedule_conversation_summary(self, conversation_id: UUID) -> None:
         """回复结束后派发会话摘要 + 洞察刷新(摘要未达阈值时内部直接返回)"""
         from ..tasks import dispatch
 
-        dispatch.enqueue_summary(conversation_id, self._interest_tasks)
-        dispatch.enqueue_insight(self._pending_user_id, self._interest_tasks)
+        dispatch.enqueue_summary(conversation_id)
+        dispatch.enqueue_insight(self._pending_user_id)
 
     async def _load_emotion_block(self, user_id: UUID, content: str) -> str:
         """情绪档案(常驻);负面信号时追加相关记忆,失败一律降级为空"""
@@ -201,7 +198,7 @@ class ChatService:
         return "[相关记忆]\n" + "\n".join(lines[:3])
 
     def _schedule_emotion_analysis(self, conversation_id: UUID) -> None:
-        """回复结束后派发情绪分析(与兴趣同款:队列或进程内)"""
+        """回复结束后派发情绪分析:与兴趣同款,投递到 Celery 队列由 worker 消费"""
         from ..tasks import dispatch
 
         dispatch.enqueue_emotion(

@@ -12,6 +12,7 @@ from .core.request_context import RequestContextMiddleware
 from .db import close_postgres, neo4j_client, close_redis
 
 import logging
+import asyncio
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,18 @@ async def lifespan(app: FastAPI):
         logger.info("✅ Redis 连接成功")
     except Exception as e:
         logger.warning(f"⚠️ Redis 连接失败: {e}")
+
+    # 后台任务靠 worker 消费:启动时探测一次,没起就明确告警(避免"功能看起来没反应")
+    try:
+        from .tasks.dispatch import worker_alive
+
+        if not await asyncio.to_thread(worker_alive, 2.0):
+            logger.warning(
+                "⚠️ 没有检测到 Celery worker:兴趣抽取 / 情绪分析 / 会话摘要 / 洞察刷新都不会执行。"
+                "请另开终端启动:celery -A app.celery_app worker --pool=solo -l info(见 README)"
+            )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"⚠️ 检测 Celery worker 失败(忽略): {e}")
 
     logger.info(f"✨ {settings.app_name} 启动完成")
 

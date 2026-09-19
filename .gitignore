@@ -29,6 +29,7 @@ _staging/
 
 # 运行产物
 api/results/
+celerybeat-schedule*
 *.log
 .pytest_cache/
 .ruff_cache/
