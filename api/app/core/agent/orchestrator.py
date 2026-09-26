@@ -27,6 +27,18 @@ MAX_RESULT_PREVIEW = 600
 
 Emit = Callable[[dict], Awaitable[None]]
 
+# 事件类型 → 阶段,用于运行轨迹里按阶段定位(模型/工具/收尾)
+_EVENT_PHASE = {
+    "tool_start": "tool",
+    "tool_result": "tool",
+    "tool_approval_required": "tool",
+    "token": "model",
+    "model_result": "model",
+    "final": "final",
+    "error": "error",
+    "run": "run",
+}
+
 
 class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
@@ -81,12 +93,14 @@ def build_function_calling_graph(model, tools: list, emit: Emit):
     async def agent_node(state: AgentState) -> dict:
         full_text = ""
         gathered = None
+        started = time.monotonic()
         async for chunk in model_with_tools.astream(state["messages"]):
             content = chunk.content
             if isinstance(content, str) and content:
                 full_text += content
                 await emit({"type": "token", "text": content})
             gathered = chunk if gathered is None else gathered + chunk
+        await emit({"type": "model_result", "latency_ms": int((time.monotonic() - started) * 1000)})
         return {
             "messages": [gathered],
             "iterations": state["iterations"] + 1,
@@ -193,11 +207,13 @@ def build_react_graph(model, tools: list, emit: Emit):
 
     async def agent_node(state: AgentState) -> dict:
         full_text = ""
+        started = time.monotonic()
         async for chunk in model.astream(state["messages"]):
             content = chunk.content
             if isinstance(content, str) and content:
                 full_text += content
                 await emit({"type": "token", "text": content})
+        await emit({"type": "model_result", "latency_ms": int((time.monotonic() - started) * 1000)})
         action = _parse_react(full_text)
         return {
             "messages": [AIMessage(content=full_text)],
@@ -278,6 +294,8 @@ async def run_agent(
     messages: list,
     supports_function_call: bool,
     emit: Emit,
+    run_id: str | None = None,
+    model_meta: dict | None = None,
 ) -> None:
     """运行 Agent,事件通过 emit 异步推送;结束时统一发出 final 事件"""
     # 工具循环可能把额度用完却一次文本都没产出(模型连续调工具),那样用户会拿到空白回复;
@@ -288,6 +306,10 @@ async def run_agent(
         nonlocal produced_text
         if event.get("type") == "token" and (event.get("text") or "").strip():
             produced_text = True
+        event.setdefault("run_id", run_id)
+        event.setdefault("phase", _EVENT_PHASE.get(event.get("type"), "agent"))
+        if event.get("type") in ("token", "model_result"):
+            event.setdefault("model", model_meta or {})
         await emit(event)
 
     graph = (
@@ -302,12 +324,12 @@ async def run_agent(
         raise
     except Exception as e:
         logger.exception("Agent 编排失败")
-        await emit({"type": "error", "message": f"Agent 编排失败:{e}"})
+        await tracked_emit({"type": "error", "message": f"Agent 编排失败:{e}"})
     if not produced_text:
-        await emit(
+        await tracked_emit(
             {
                 "type": "token",
                 "text": "抱歉,这轮我没能整理出回答(工具调用次数已用完)。请把问题再问一次,或换个更具体的说法。",
             }
         )
-    await emit({"type": "final", "text": ""})
+    await tracked_emit({"type": "final", "text": ""})

@@ -115,6 +115,27 @@ async def main():
     assert len(tool3.calls) == 1, f"缓存失效,执行了 {len(tool3.calls)} 次"
     print("== tool result cache ok ==")
 
+    # 5. run_id / phase / model_result 注入:每个事件都能按 run_id 归拢
+    events4 = []
+
+    async def emit4(e):
+        events4.append(e)
+
+    model4 = FakeFCModel([{"content": "hi"}])
+    await run_agent(
+        model4,
+        [],
+        [{"role": "user", "content": "hi"}],
+        True,
+        emit4,
+        run_id="run-1",
+        model_meta={"provider": "deepseek", "model": "deepseek-chat"},
+    )
+    assert all(e.get("run_id") == "run-1" for e in events4), "事件没有统一带上 run_id"
+    assert any(e.get("type") == "model_result" and e.get("phase") == "model" for e in events4)
+    assert any(e.get("type") == "final" and e.get("phase") == "final" for e in events4)
+    print("== run_id/phase trace ok ==")
+
     print("ALL PASS")
 
 

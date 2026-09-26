@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import time
+import uuid
 from contextvars import ContextVar
 
 from langgraph.graph import END, START, StateGraph
@@ -241,6 +242,7 @@ _REVIEW_GRAPH = build_review_graph()
 
 async def run_review(session, user_id, *, days: int = 7, persist: bool = False, goal: str | None = None) -> dict:
     """对外入口:对话工具 / REST / 定时任务共用"""
+    review_run_id = str(uuid.uuid4())
     initial: ReviewState = {
         "user_id": user_id,
         "window_days": days,
@@ -263,6 +265,7 @@ async def run_review(session, user_id, *, days: int = 7, persist: bool = False, 
             "degraded": [f"执行失败:{exc}"],
             "replans": 0,
             "error": str(exc),
+            "review_run_id": review_run_id,
         }
     finally:
         _SESSION.reset(session_token)
@@ -279,4 +282,5 @@ async def run_review(session, user_id, *, days: int = 7, persist: bool = False, 
         "summary": final.get("summary") or "",
         "degraded": list(final.get("degraded") or []),
         "replans": int(final.get("replans") or 0),
+        "review_run_id": review_run_id,
     }

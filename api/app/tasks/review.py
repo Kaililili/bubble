@@ -30,7 +30,9 @@ def _format_reply(result: dict) -> str:
     return report + "\n\n---\n" + "\n".join(footer)
 
 
-async def _write_back(session, user_id: UUID, conversation_id: UUID | None, content: str) -> None:
+async def _write_back(
+    session, user_id: UUID, conversation_id: UUID | None, content: str, review_run_id: str | None = None
+) -> None:
     """把结果作为一条助手消息写回会话(顺带刷新会话活跃时间)"""
     if conversation_id is None:
         return
@@ -45,7 +47,11 @@ async def _write_back(session, user_id: UUID, conversation_id: UUID | None, cont
         conversation_id,
         role="assistant",
         content=content,
-        metadata={"source": "weekly_review", "async": True},
+        metadata={
+            "source": "weekly_review",
+            "async": True,
+            "review_run_id": review_run_id,
+        },
     )
     conversation.updated_at = datetime.now(timezone.utc)
     await session.commit()
@@ -63,7 +69,9 @@ async def run_generate_review(
         async with async_session() as session:
             result = await run_review(session, user_id, days=int(days), persist=bool(persist))
             reply = _format_reply(result)
-            await _write_back(session, user_id, conversation_id, reply)
+            await _write_back(
+                session, user_id, conversation_id, reply, result.get("review_run_id")
+            )
             logger.info(
                 "review generated for %s: report=%s chars, replans=%s, degraded=%s",
                 user_id,

@@ -2,21 +2,22 @@
 import asyncio
 import json
 import logging
+import uuid
 from collections.abc import AsyncGenerator
 from uuid import UUID
 
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..core.agent.orchestrator import run_agent
 from ..core.agent.intent import detect_memory_intent
-from ..prompts.chat import CHAT_SYSTEM_PROMPT as SYSTEM_PROMPT
+from ..core.agent.orchestrator import run_agent
 from ..core.agent.prompt_renderer import render_tools_prompt
 from ..core.agent.tools import build_enabled_tools
 from ..core.exceptions import AppException
 from ..core.llm.client import build_chat_model
 from ..core.llm.resolver import get_default_config
 from ..core.security import sanitize_credential_text
+from ..prompts.chat import CHAT_SYSTEM_PROMPT as SYSTEM_PROMPT
 from ..repositories.conversation_repository import ConversationRepository
 from ..repositories.message_repository import MessageRepository
 
@@ -36,6 +37,8 @@ class ChatService:
         self._pending_user_id = None
         self._pending_user_text = ""
         self._pending_message_id = None
+        self._pending_run_id = None
+        self._pending_model_meta = None
         self._pending_context: list[str] = []
 
     async def _load_profile_block(self, user_id: UUID) -> str:
@@ -105,6 +108,8 @@ class ChatService:
         config = await get_default_config(self.session, user_id, "chat")
         model = build_chat_model(config)
         supports = bool(config.supports_function_call)
+        self._pending_run_id = str(uuid.uuid4())
+        self._pending_model_meta = {"provider": config.provider, "model": config.model_name}
 
         # 先读历史(不含当前消息):只取最近一屏,更早的部分由滚动摘要代替
         from ..core.agent.memory.context import RECENT_WINDOW, format_summary_block
@@ -123,7 +128,7 @@ class ChatService:
         user_message = await self.messages.create(conversation_id, role="user", content=safe_content)
         self._pending_message_id = getattr(user_message, "id", None)
         tools = await build_enabled_tools(
-            self.session, user_id, conversation_id, self._pending_message_id
+            self.session, user_id, conversation_id, self._pending_message_id, self._pending_run_id
         )
 
         system_prompt = SYSTEM_PROMPT
@@ -281,11 +286,23 @@ class ChatService:
         async def emit(event: dict):
             await queue.put(event)
 
-        task = asyncio.create_task(run_agent(model, tools, history, supports, emit))
+        task = asyncio.create_task(
+            run_agent(
+                model,
+                tools,
+                history,
+                supports,
+                emit,
+                run_id=self._pending_run_id,
+                model_meta=self._pending_model_meta,
+            )
+        )
         full_text = ""
         tool_events = []
         error_message = ""
         error_sent = False
+        # 先告知客户端本次 run_id(不改变原有消息结构)
+        yield json.dumps({"type": "run", "run_id": self._pending_run_id}, ensure_ascii=False)
         try:
             while True:
                 try:
@@ -345,6 +362,7 @@ class ChatService:
                     role="assistant",
                     content=full_text,
                     tool_calls={"events": tool_events} if tool_events else None,
+                    metadata={"run_id": self._pending_run_id},
                 )
             await self.conversations.touch(conversation_id)
             await self._schedule_interest_extraction(conversation_id)

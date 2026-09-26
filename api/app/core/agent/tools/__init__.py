@@ -18,14 +18,16 @@ async def _tool_configured(session, user_id: str, tool_key: str) -> bool:
     return True
 
 
-async def build_enabled_tools(session, user_id: str, conversation_id=None, message_id=None) -> list:
+async def build_enabled_tools(
+    session, user_id: str, conversation_id=None, message_id=None, run_id=None
+) -> list:
     """构建当前用户可用(已启用且已配置)的 LangChain 工具列表
 
     message_id 是本次用户消息的 id(需先落库再构建工具),写记忆时用它做来源溯源。
     """
     rows = await ToolConfigRepository(session).list_by_user(user_id)
     user_set = {r.tool_key: r.enabled for r in rows}
-    ctx = ToolContext(session, user_id, conversation_id, message_id)
+    ctx = ToolContext(session, user_id, conversation_id, message_id, run_id)
     tools = []
     for key, spec in REGISTRY.items():
         enabled = user_set.get(key, spec.default_enabled)

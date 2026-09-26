@@ -22,6 +22,7 @@ class ToolContext:
         user_id: uuid.UUID,
         conversation_id=None,
         message_id=None,
+        run_id=None,
     ):
         self.session = session
         self.user_id = user_id
@@ -29,6 +30,8 @@ class ToolContext:
         self.conversation_id = conversation_id
         # 当前这条用户消息 id:写入记忆时一并记下,回答个人事实时可回指原话(来源溯源)
         self.message_id = message_id
+        # 本次对话 run_id:审批/下单等旁路动作与主对话关联,用于定位一次请求
+        self.run_id = run_id
 
 
 class ToolSpec:
