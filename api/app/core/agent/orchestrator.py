@@ -280,10 +280,20 @@ async def run_agent(
     emit: Emit,
 ) -> None:
     """运行 Agent,事件通过 emit 异步推送;结束时统一发出 final 事件"""
+    # 工具循环可能把额度用完却一次文本都没产出(模型连续调工具),那样用户会拿到空白回复;
+    # 这里记一笔,收尾时补一条可读提示。
+    produced_text = False
+
+    async def tracked_emit(event: dict) -> None:
+        nonlocal produced_text
+        if event.get("type") == "token" and (event.get("text") or "").strip():
+            produced_text = True
+        await emit(event)
+
     graph = (
-        build_function_calling_graph(model, tools, emit)
+        build_function_calling_graph(model, tools, tracked_emit)
         if supports_function_call
-        else build_react_graph(model, tools, emit)
+        else build_react_graph(model, tools, tracked_emit)
     )
     state: AgentState = {"messages": messages, "iterations": 0, "pending_action": None}
     try:
@@ -293,4 +303,11 @@ async def run_agent(
     except Exception as e:
         logger.exception("Agent 编排失败")
         await emit({"type": "error", "message": f"Agent 编排失败:{e}"})
+    if not produced_text:
+        await emit(
+            {
+                "type": "token",
+                "text": "抱歉,这轮我没能整理出回答(工具调用次数已用完)。请把问题再问一次,或换个更具体的说法。",
+            }
+        )
     await emit({"type": "final", "text": ""})

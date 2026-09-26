@@ -14,6 +14,9 @@ from app.prompts import (
     EXTRACT_SYSTEM_PROMPT,
     PROMPT_REGISTRY,
     REFLECT_PROMPT,
+    REVIEW_ANALYZE_PROMPT,
+    REVIEW_COMPOSE_PROMPT,
+    REVIEW_PLAN_PROMPT,
     SUMMARY_PROMPT,
     SUPERSEDE_PROMPT,
     build_emotion_prompt,
@@ -29,6 +32,9 @@ TEXTS = {
     "memory.summary": SUMMARY_PROMPT,
     "memory.reflect": REFLECT_PROMPT,
     "memory.supersede": SUPERSEDE_PROMPT,
+    "review.plan": REVIEW_PLAN_PROMPT,
+    "review.analyze": REVIEW_ANALYZE_PROMPT,
+    "review.compose": REVIEW_COMPOSE_PROMPT,
     "emotion.analyze": build_emotion_prompt(),
 }
 

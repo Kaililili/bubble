@@ -42,20 +42,56 @@ class ChatService:
         """加载用户背景,拼成固定格式文本;超长按 importance 从高到低截断"""
         from ..repositories.memory_repository import UserProfileRepository
 
-        profiles = await UserProfileRepository(self.session).list_by_user(user_id)
+        repo = UserProfileRepository(self.session)
+        profiles = await repo.list_by_user(user_id)
         if not profiles:
             return ""
+        stale = await self._stale_profile_keys(repo, user_id, profiles)
         lines = ["[用户背景]"]
         total = 0
         for p in profiles:
+            if p.key in stale:
+                continue
             line = f"{p.key}: {p.value}"
             total += len(line) + 1
             if total > MAX_PROFILE_CHARS:
                 break
             lines.append(line)
+        for key in sorted(stale):
+            lines.append(f"(字段「{key}」已被更新的记录取代,当前不生效)")
         if len(lines) == 1:
             return ""
         return "\n".join(lines)
+
+    async def _stale_profile_keys(self, repo, user_id: UUID, profiles: list) -> set[str]:
+        """背景里已经不成立的字段:该值出现在比它更新的"已被取代"记忆里。
+
+        例:背景写着"常驻城市: 上海",之后用户改口"现在改为优先杭州"并让旧记忆失效 ——
+        此时继续把上海注入提示词会让模型拿旧值当当前偏好,这里直接把该字段挡掉。
+        只做运行时抑制,不改用户数据(用户可在面板里更新或删除)。
+        """
+        try:
+            oldest = min((p.updated_at for p in profiles if p.updated_at), default=None)
+            superseded = await repo.superseded_since(user_id, oldest)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("check stale profile failed: %s", exc)
+            return set()
+        if not superseded:
+            return set()
+        stale: set[str] = set()
+        for p in profiles:
+            value = (p.value or "").strip()
+            if len(value) < 2:
+                continue
+            for memory in superseded:
+                if p.updated_at and memory.updated_at and memory.updated_at < p.updated_at:
+                    continue
+                if value in (memory.content or ""):
+                    stale.add(p.key)
+                    break
+        if stale:
+            logger.info("skip stale profile fields: %s", ",".join(sorted(stale)))
+        return stale
 
     async def prepare(self, conversation_id: UUID, user_id: UUID, content: str):
         """校验会话、持久化用户消息、构建模型/工具/历史。

@@ -1,4 +1,5 @@
 """记忆数据访问层:用户背景 + 长尾记忆"""
+import re
 from datetime import datetime, timezone
 from uuid import UUID
 
@@ -6,6 +7,23 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..models.memory_model import Memory, UserProfile
+
+_KEY_NOISE_RE = re.compile(r"[\s:：_\-·/]+")
+
+
+def normalize_profile_key(key: str) -> str:
+    """背景字段名归一化(大小写/空格/分隔符不敏感),用于"同一个字段"判定"""
+    return _KEY_NOISE_RE.sub("", key or "").strip().lower()
+
+
+def similar_profile_key(a: str, b: str) -> bool:
+    """两个背景字段名是否指向同一属性(包含关系,或共享同一个 2 字属性词尾)"""
+    na, nb = normalize_profile_key(a), normalize_profile_key(b)
+    if not na or not nb:
+        return False
+    if na == nb or na in nb or nb in na:
+        return True
+    return len(na) >= 2 and len(nb) >= 2 and na[-2:] == nb[-2:]
 
 
 class UserProfileRepository:
@@ -33,8 +51,15 @@ class UserProfileRepository:
         return result.scalar_one_or_none()
 
     async def upsert(self, user_id: UUID, key: str, value: str, importance: int = 0) -> UserProfile:
+        # 字段名先按归一化匹配:大小写/空格差异不产生第二行(避免"同一属性两处不一致")
         profile = await self.get_by_key(user_id, key)
+        if profile is None:
+            for row in await self.list_by_user(user_id):
+                if normalize_profile_key(row.key) == normalize_profile_key(key):
+                    profile = row
+                    break
         if profile:
+            profile.key = key
             profile.value = value
             profile.importance = importance
         else:
@@ -43,6 +68,26 @@ class UserProfileRepository:
         await self.session.commit()
         await self.session.refresh(profile)
         return profile
+
+    async def find_similar_key_conflicts(
+        self, user_id: UUID, key: str, value: str
+    ) -> list[UserProfile]:
+        """同一属性名下的旧值:字段名相近但当前值不同(提示调用方统一字段名/更新值)"""
+        out: list[UserProfile] = []
+        for row in await self.list_by_user(user_id):
+            if row.key == key:
+                continue
+            if similar_profile_key(row.key, key) and (row.value or "").strip() != (value or "").strip():
+                out.append(row)
+        return out
+
+    async def superseded_since(self, user_id: UUID, since: datetime | None) -> list[Memory]:
+        """某时间点之后被新事实取代的旧记忆(用于抑制已过时的背景值注入)"""
+        stmt = select(Memory).where(Memory.user_id == user_id, Memory.status == "superseded")
+        if since is not None:
+            stmt = stmt.where(Memory.updated_at >= since)
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
 
     async def delete(self, profile: UserProfile) -> None:
         await self.session.delete(profile)
@@ -127,6 +172,60 @@ class MemoryRepository:
         await self.session.delete(memory)
         await self.session.commit()
         return True
+
+    async def find_active_by_content(self, user_id: UUID, type: str, content: str) -> Memory | None:
+        """幂等检查:同类型 + 归一化文本完全相同 + 仍有效的记忆"""
+        from ..core.agent.memory.supersede import normalize_fact
+
+        target = normalize_fact(content)
+        if not target:
+            return None
+        result = await self.session.execute(
+            select(Memory).where(
+                Memory.user_id == user_id,
+                Memory.type == type,
+                Memory.status == "active",
+            )
+        )
+        for memory in result.scalars().all():
+            if normalize_fact(memory.content or "") == target:
+                return memory
+        return None
+
+    async def search_active(
+        self,
+        user_id: UUID,
+        *,
+        query_vector: list | None = None,
+        keyword: str | None = None,
+        limit: int = 5,
+    ) -> list[Memory]:
+        """只召回仍有效(active)的记忆,供删除类操作使用:失效历史不参与候选。
+
+        排序:内容精确命中的排在最前,否则按向量相似度。
+        """
+        candidates = await self.search_candidates(
+            user_id, query_vector, keyword, limit=limit, include_superseded=False
+        )
+        key = (keyword or "").strip()
+        candidates.sort(
+            key=lambda item: (
+                0 if key and key in (item[0].content or "") else 1,
+                -(item[1] or 0.0),
+            )
+        )
+        return [memory for memory, _sim in candidates]
+
+    async def count_matching(self, user_id: UUID, keyword: str, status: str | None = None) -> int:
+        """按关键词统计记忆条数(可按状态过滤),用于向用户说明命中的是失效历史版本"""
+        from sqlalchemy import func
+
+        stmt = select(func.count()).select_from(Memory).where(
+            Memory.user_id == user_id, Memory.content.ilike(f"%{keyword}%")
+        )
+        if status:
+            stmt = stmt.where(Memory.status == status)
+        return int((await self.session.execute(stmt)).scalar_one() or 0)
 
     async def search_by_vector(self, user_id: UUID, query_vector: list, top_k: int = 5) -> list[Memory]:
         result = await self.session.execute(

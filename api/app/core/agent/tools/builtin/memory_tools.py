@@ -46,15 +46,26 @@ class SaveProfileArgs(BaseModel):
 
 @register_tool(
     "save_profile",
-    "把用户的重点基本信息(姓名、过敏、职业、常驻城市、长期偏好等稳定信息)存到用户背景。用户透露这类稳定信息时调用。",
+    "把用户的重点基本信息(姓名、过敏、职业、常驻城市、长期偏好等稳定信息)存到用户背景。用户透露这类稳定信息时调用。"
+    "更新已经存在的背景字段时,沿用原来的字段名(同一属性不要换名字),这样旧值才会被真正覆盖。",
     SaveProfileArgs,
 )
 async def save_profile(ctx: ToolContext, key: str, value: str, importance: int = 0) -> str:
     from .....repositories.memory_repository import UserProfileRepository
 
     repo = UserProfileRepository(ctx.session)
-    await repo.upsert(ctx.user_id, key, value, importance)
-    return f"已记住用户背景:{key}={value}"
+    profile = await repo.upsert(ctx.user_id, key, value, importance)
+    conflicts = await repo.find_similar_key_conflicts(ctx.user_id, profile.key, value)
+    if conflicts:
+        from .....core.security import sanitize_credential_text
+
+        old = "、".join(f"{p.key}={sanitize_credential_text(p.value)}" for p in conflicts[:2])
+        return (
+            f"已记住用户背景:{profile.key}={value}"
+            f"\n注意:背景里还有相近的字段({old})。如果指的是同一个属性,"
+            "请用 save_profile 把那个字段也更新成最新值,否则旧值会继续注入对话上下文。"
+        )
+    return f"已记住用户背景:{profile.key}={value}"
 
 
 class RememberArgs(BaseModel):
@@ -112,6 +123,14 @@ async def remember(ctx: ToolContext, content: str, type: str | None = None) -> s
             await repo.update(existing)
             return f"已更新凭证:{display_content}"
 
+    # 幂等:同一条事实被重复陈述时复用既有记录,不再堆一条(重复记录会互相干扰检索与回顾)
+    same = await repo.find_active_by_content(ctx.user_id, mtype, display_content)
+    if same is not None:
+        if embedding is not None:
+            same.embedding = embedding
+        await repo.update(same)
+        return f"已记住[{mtype}]:{display_content}(与既有记录一致,未重复保存)"
+
     memory = await repo.create(
         user_id=ctx.user_id,
         type=mtype,
@@ -126,15 +145,44 @@ async def remember(ctx: ToolContext, content: str, type: str | None = None) -> s
 
             marked = await apply_supersede(ctx.session, ctx.user_id, memory, embedding)
             if marked:
+                hint = await _profile_outdated_hint(ctx, marked, display_content)
                 return (
                     f"已记住[{mtype}]:{display_content}"
                     + "\n(已把旧记录标记为失效: "
                     + " | ".join(marked[:2])
                     + ")"
+                    + hint
                 )
         except Exception:  # noqa: BLE001
             pass
     return f"已记住[{mtype}]:{display_content}"
+
+
+async def _profile_outdated_hint(ctx: ToolContext, old_contents: list, new_content: str) -> str:
+    """旧事实失效后提示模型同步更新用户背景(背景是常驻注入,不能留着旧值)"""
+    try:
+        from .....core.security import sanitize_credential_text
+        from .....repositories.memory_repository import UserProfileRepository
+
+        rows = await UserProfileRepository(ctx.session).list_by_user(ctx.user_id)
+    except Exception:  # noqa: BLE001
+        return ""
+    new_norm = "".join((new_content or "").split())
+    stale: list[str] = []
+    for row in rows:
+        value = (row.value or "").strip()
+        if len(value) < 2 or value in new_norm:
+            continue
+        if any(value in (old or "") for old in old_contents):
+            stale.append(f"{row.key}={sanitize_credential_text(value)}")
+    if not stale:
+        return ""
+    return (
+        "\n注意:用户背景里仍保留着旧值("
+        + "、".join(stale[:3])
+        + ")。这是常驻注入的内容,请调用 save_profile 用同一个字段名更新为最新值,"
+        "不要让旧值继续当作当前信息使用。"
+    )
 
 
 class RecallArgs(BaseModel):
@@ -171,26 +219,42 @@ async def forget(ctx: ToolContext, query: str) -> str:
     from .....repositories.memory_repository import MemoryRepository
 
     repo = MemoryRepository(ctx.session)
-    candidates: list = []
+    vector = None
     try:
         config = await get_default_config(ctx.session, ctx.user_id, "embedding")
         embedder = build_embedding_model(config)
-        vec = await embedder.aembed_query(query)
-        candidates.extend(await repo.search_by_vector(ctx.user_id, vec, top_k=3))
-    except Exception:
-        pass
-    candidates.extend(await repo.search_by_keyword(ctx.user_id, query, limit=3))
+        vector = await embedder.aembed_query(query)
+    except Exception:  # noqa: BLE001
+        vector = None
 
+    # 只在"仍然有效"的记忆里选目标:被新事实取代的历史记录不该被误删
+    from .....core.agent.memory.supersede import candidate_keywords
+
+    probes = [query, *[p for p in candidate_keywords(query) if p != query]]
+    targets: list = []
     seen: set = set()
-    unique: list = []
-    for c in candidates:
-        if c.id in seen:
-            continue
-        seen.add(c.id)
-        unique.append(c)
+    for index, probe in enumerate(probes):
+        rows = await repo.search_active(
+            ctx.user_id,
+            query_vector=vector if index == 0 else None,
+            keyword=probe,
+            limit=5,
+        )
+        for row in rows:
+            if row.id not in seen:
+                seen.add(row.id)
+                targets.append(row)
+        if targets:
+            break
 
-    if not unique:
+    if not targets:
+        superseded = await repo.count_matching(ctx.user_id, query, status="superseded")
+        if superseded:
+            return (
+                f"没有找到仍有效的记忆(关键词只命中 {superseded} 条已失效的历史记录,"
+                "已为你保留,未做删除)。如果确实要清理历史版本,请到记忆面板里操作。"
+            )
         return "没有找到匹配的记忆。"
-    target = unique[0]
+    target = targets[0]
     await repo.delete(target)
     return f"已删除记忆:[{target.type}] {target.content}"

@@ -130,7 +130,7 @@ async def step_collect_interests(session, user_id, args: dict, deps: dict) -> di
 
 
 async def step_collect_memories(session, user_id, args: dict, deps: dict) -> dict:
-    """取这段时间落库的长尾记忆与事件(凭证类不参与回顾)"""
+    """取这段时间落库的长尾记忆与事件(凭证类与已失效记录不参与"当前事实")"""
     from sqlalchemy import select
 
     from ....models.memory_model import Memory
@@ -143,6 +143,7 @@ async def step_collect_memories(session, user_id, args: dict, deps: dict) -> dic
             Memory.user_id == user_id,
             Memory.created_at >= since,
             Memory.type != "credential",
+            Memory.status == "active",
         )
         .order_by(Memory.created_at.desc())
         .limit(MAX_MEMORY_ITEMS)
@@ -151,16 +152,42 @@ async def step_collect_memories(session, user_id, args: dict, deps: dict) -> dic
     if not rows:
         return {"status": "empty", "data": {"days": days, "count": 0}, "note": f"近 {days} 天没有新的记忆"}
     by_type = Counter(r.type for r in rows)
+    # 变化摘要:这批新记忆取代了哪些旧记录(旧记录不进"当前事实",只作为"由 X 变成 Y"的依据)
+    changes: list[dict] = []
+    old_stmt = select(Memory).where(
+        Memory.user_id == user_id,
+        Memory.superseded_by.in_([r.id for r in rows]),
+    )
+    for old in (await session.execute(old_stmt)).scalars().all():
+        new = next((r for r in rows if r.id == old.superseded_by), None)
+        changes.append(
+            {
+                "type": old.type,
+                "from": _clip(old.content, CONTENT_PREVIEW),
+                "to": _clip(new.content, CONTENT_PREVIEW) if new else "",
+                "at": old.updated_at.date().isoformat() if old.updated_at else None,
+            }
+        )
     data = {
         "days": days,
         "count": len(rows),
         "by_type": dict(by_type),
+        "changes": changes,
         "items": [
-            {"type": r.type, "content": _clip(r.content, CONTENT_PREVIEW), "created_at": r.created_at.date().isoformat()}
+            {
+                "memory_id": str(r.id),
+                "type": r.type,
+                "content": _clip(r.content, CONTENT_PREVIEW),
+                "created_at": r.created_at.date().isoformat(),
+                "status": r.status,
+            }
             for r in rows[:12]
         ],
     }
-    return {"status": "ok", "data": data, "note": f"这段时间新增记忆 {len(rows)} 条"}
+    note = f"这段时间新增记忆 {len(rows)} 条"
+    if changes:
+        note += f",其中 {len(changes)} 处是已有事实被更新"
+    return {"status": "ok", "data": data, "note": note}
 
 
 # ---------- 分析 / 成文 / 落地 ----------
@@ -230,6 +257,13 @@ def _rule_observations(emotion: dict, interests: dict, memories: dict, days: int
         out.append(f"近 {days} 天没有出现新的兴趣实体。")
     if memories.get("count"):
         out.append(f"新增记忆 {memories['count']} 条,类型分布 {memories.get('by_type')}。")
+        changes = memories.get("changes") or []
+        if changes:
+            out.append(
+                "其中发生变化的:"
+                + ";".join(f"{c['from']} → {c['to']}(以新值为准)" for c in changes[:3])
+                + "。"
+            )
     else:
         out.append(f"近 {days} 天没有新增记忆。")
     return out
