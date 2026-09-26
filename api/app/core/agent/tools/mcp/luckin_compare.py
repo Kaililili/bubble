@@ -10,13 +10,14 @@
 - 内部用单个 MCP session 串行调用,避免每次工具调用重新握手。
 - 只查询,不触碰 previewOrder/createOrder/cancelOrder 等副作用工具。
 """
+import asyncio
 import json
 import logging
+from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
 from pydantic import BaseModel, Field
-
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..base import ToolContext, register_tool
@@ -27,6 +28,14 @@ logger = logging.getLogger(__name__)
 DEFAULT_LONGITUDE = 116.397
 DEFAULT_LATITUDE = 39.909
 MAX_SHOPS = 5
+
+# 只读调用超时与重试:读操作有上限重试,写操作(retries=0)绝不盲目重试
+READ_TIMEOUT = 12.0
+READ_RETRIES = 1
+
+
+class MCPTimeout(Exception):
+    """外部 MCP 服务超时(与"没有结果""格式错误"区分)"""
 
 
 def _match_score(keyword: str, name: str) -> int:
@@ -87,9 +96,20 @@ class LuckinCompareArgs(BaseModel):
     latitude: float | None = Field(None, description="纬度,缺省用默认位置")
 
 
-async def _call_json(session: Any, name: str, args: dict) -> dict:
+async def _call_json(
+    session: Any, name: str, args: dict, *, timeout: float = READ_TIMEOUT, retries: int = READ_RETRIES
+) -> dict:
     """调用 MCP 工具并把返回 content 解析为 JSON。"""
-    result = await session.call_tool(name, args)
+    result = None
+    for attempt in range(retries + 1):
+        try:
+            result = await asyncio.wait_for(session.call_tool(name, args), timeout=timeout)
+            break
+        except asyncio.TimeoutError as exc:
+            if attempt >= retries:
+                raise MCPTimeout(f"{name} 超时(>{timeout:.0f}s)") from exc
+    if result is None:
+        raise MCPTimeout(f"{name} 超时(>{timeout:.0f}s)")
     text = ""
     for c in result.content:
         if getattr(c, "text", None) is not None:
@@ -221,6 +241,9 @@ async def run_luckin_compare(
                     # search 返回的是「超大杯」等高规格价;详情接口返回默认规格(大杯)的预估价,
                     # 与小程序默认展示一致,故以 detail 为准
                     price = first.get("estimatePrice")
+                    original_price = first.get("initialPrice")
+                    spec = None
+                    sellable = True
                     if product_id:
                         try:
                             detail_data = await _call_json(
@@ -231,8 +254,9 @@ async def run_luckin_compare(
                             detail = detail_data.get("data") or {}
                             if isinstance(detail, dict):
                                 price = detail.get("estimatePrice")
-                                if price is None:
-                                    price = detail.get("initialPrice")
+                                original_price = detail.get("initialPrice")
+                                spec = detail.get("additionDesc") or detail.get("spec")
+                                sellable = detail.get("onSale") not in (0, False, "0")
                                 if not product_name:
                                     product_name = detail.get("productName", "")
                         except Exception:  # noqa: BLE001
@@ -242,9 +266,15 @@ async def run_luckin_compare(
                             "dept_id": shop.get("deptId"),
                             "shop": shop.get("deptName", f"门店{dept_id}"),
                             "distance_km": shop.get("distance"),
-                            "price": price,
                             "product": product_name,
                             "product_id": product_id,
+                            "spec": spec,
+                            "original_price": original_price,
+                            "actual_price": price,
+                            "price": price,
+                            "sellable": sellable,
+                            "fetched_at": datetime.now(timezone.utc).isoformat(),
+                            "source": "luckin",
                         }
                     )
 
@@ -258,11 +288,14 @@ async def run_luckin_compare(
                             )
                         }
                     ]
-                results.sort(key=lambda x: (x["price"] is None, x["price"] or 0))
+                results.sort(key=lambda x: (x["actual_price"] is None, x["actual_price"] or 0))
                 return results[:3]
+    except MCPTimeout as e:
+        logger.warning("瑞幸比价超时: %s", e)
+        return [{"error_type": "timeout", "error": str(e)}]
     except Exception as e:  # noqa: BLE001
         logger.warning("瑞幸比价失败: %s", e)
-        return [{"error": f"瑞幸服务暂不可用: {e}"}]
+        return [{"error_type": "unavailable", "error": f"瑞幸服务暂不可用: {e}"}]
 
 
 async def run_luckin_nearby_shops(
@@ -541,6 +574,7 @@ async def run_order_create(
                         "latitude": lat,
                         "remark": remark,
                     },
+                    retries=0,  # 下单有副作用:超时不自动重试,由上层标记 unknown
                 )
                 if created.get("code") != 0:
                     return {"error": created.get("msg") or "下单失败"}
@@ -552,9 +586,12 @@ async def run_order_create(
                     "discount_price": data.get("discountPrice"),
                     "need_pay": data.get("needPay"),
                 }
+    except MCPTimeout as e:
+        logger.warning("瑞幸下单超时: %s", e)
+        return {"error_type": "timeout", "error": str(e)}
     except Exception as e:  # noqa: BLE001
         logger.warning("瑞幸下单失败: %s", e)
-        return {"error": f"下单失败: {e}"}
+        return {"error_type": "failed", "error": f"下单失败: {e}"}
 
 
 async def run_order_cancel(session: AsyncSession, user_id: UUID, order_id: str) -> dict:
@@ -569,12 +606,14 @@ async def run_order_cancel(session: AsyncSession, user_id: UUID, order_id: str) 
         async with cm as (read, write, _):
             async with ClientSession(read, write) as mcp:
                 await mcp.initialize()
-                result = await _call_json(mcp, "cancelOrder", {"orderId": str(order_id)})
+                result = await _call_json(mcp, "cancelOrder", {"orderId": str(order_id)}, retries=0)
                 if result.get("code") != 0:
                     return {"error": result.get("msg") or "取消失败"}
                 return {"cancelled": bool(result.get("data"))}
+    except MCPTimeout as e:
+        return {"error_type": "timeout", "error": str(e)}
     except Exception as e:  # noqa: BLE001
-        return {"error": f"取消失败: {e}"}
+        return {"error_type": "failed", "error": f"取消失败: {e}"}
 
 
 async def run_order_query(session: AsyncSession, user_id: UUID, order_id: str) -> dict:
@@ -601,5 +640,7 @@ async def run_order_query(session: AsyncSession, user_id: UUID, order_id: str) -
                     "status_name": data.get("orderStatusName") or "",
                     "pay_amount": data.get("orderPayAmount"),
                 }
+    except MCPTimeout as e:
+        return {"error_type": "timeout", "error": str(e)}
     except Exception as e:  # noqa: BLE001
-        return {"error": f"查询订单失败: {e}"}
+        return {"error_type": "failed", "error": f"查询订单失败: {e}"}

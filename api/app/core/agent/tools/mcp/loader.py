@@ -42,6 +42,21 @@ _SENSITIVE_HINTS = (
     "create", "update", "delete", "remove", "cancel", "submit", "pay",
     "order", "buy", "refund", "set", "modify", "add", "put", "post",
 )
+# 订单创建/取消/支付/提交类副作用:无论 annotations 或 sensitive_tools 怎么配,都必须强制确认
+# (只命中这些精确动词,避免把 previewOrder/queryOrderDetailInfo 这类只读也误判成强制确认)
+_FORCED_CONFIRM_HINTS = (
+    "createorder",
+    "cancelorder",
+    "payorder",
+    "create_order",
+    "cancel_order",
+    "pay_order",
+    "refund",
+    "submit",
+    "buy",
+    "purchase",
+    "payment",
+)
 
 # 确认型工具返回值前缀(内部协议):编排器据此发 tool_approval_required 事件,
 # 并把它替换成给 LLM 的友好提示(标记本身不进 LLM 上下文)
@@ -70,6 +85,12 @@ def _needs_confirmation(server: MCPServer, tool_name: str) -> bool:
     return _classify_tool(server, tool_name, ann) == "sensitive"
 
 
+def is_forced_confirm_tool(name: str) -> bool:
+    """订单/支付/取消类工具:始终要求本次确认,不允许被「记住」成免确认"""
+    lower = (name or "").lower()
+    return any(hint in lower for hint in _FORCED_CONFIRM_HINTS)
+
+
 def _annotations_map(server: MCPServer) -> dict[str, dict]:
     """从 tools_cache 取 MCP 工具的能力声明(测试连接时同步的 annotations)。"""
     out: dict[str, dict] = {}
@@ -84,11 +105,14 @@ def _annotations_map(server: MCPServer) -> dict[str, dict]:
 def _classify_tool(server: MCPServer, tool_name: str, annotations: dict | None) -> str:
     """工具分级(优先级从高到低):
 
+    ⓪ 订单/支付/取消类 → 强制 sensitive(不可被白名单/记住绕过);
     ① 用户显式配置 sensitive_tools(用户说了算);
     ② MCP annotations:destructiveHint=True 或 readOnlyHint=False → sensitive;
        readOnlyHint=True → safe;
     ③ 无声明 → 启发式(查询词语义为 safe,写操作词/无查询语义为 sensitive,保守)。
     """
+    if is_forced_confirm_tool(tool_name):
+        return "sensitive"
     if server.sensitive_tools is not None:
         sensitive = {str(x).lower() for x in server.sensitive_tools}
         return "sensitive" if tool_name.lower() in sensitive else "safe"

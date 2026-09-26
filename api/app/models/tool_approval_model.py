@@ -15,6 +15,7 @@ from ..db import Base
 # 状态
 APPROVAL_PENDING = "pending"
 APPROVAL_APPROVED = "approved"  # 已确认,执行中
+APPROVAL_EXECUTING = "executing"  # 已抢占、正在真正执行(并发只允许一个执行者)
 APPROVAL_EXECUTED = "executed"
 APPROVAL_REJECTED = "rejected"
 APPROVAL_FAILED = "failed"

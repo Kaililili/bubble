@@ -44,6 +44,7 @@ def _load_models() -> None:
         emotion_model,
         interest_community_model,
         interest_model,
+        luckin_order_model,
         mcp_server_model,
         memory_insight_model,
         memory_model,

@@ -33,15 +33,23 @@ export interface CompareItem {
   dept_id?: number | null;
   shop: string;
   distance_km?: number | null;
-  price?: number | null;
   product?: string | null;
   product_id?: number | null;
+  spec?: string | null;
+  original_price?: number | null;
+  actual_price?: number | null;
+  price?: number | null;
+  sellable?: boolean | null;
+  fetched_at?: string | null;
+  source?: string | null;
   address?: string | null;
   status?: string | null;
   hours?: string | null;
 }
 
 export interface OrderPreview {
+  preview_id?: string;
+  expires_at?: string;
   dept_id?: number;
   product_id?: number;
   shop: string;
@@ -92,6 +100,9 @@ export interface ToolApproval {
 
 export interface OrderCreated {
   order_id: string;
+  status?: string;
+  message?: string;
+  error?: string | null;
   pay_qr_url?: string | null;
   pay_url?: string | null;
   discount_price?: number | null;
@@ -146,6 +157,8 @@ export const createLuckinOrder = (payload: {
   amount?: number;
   sku_code?: string;
   remark?: string;
+  preview_id?: string;
+  request_id?: string;
 }) => client.post("/mcp/luckin/order/create", payload).then((r) => r.data as OrderCreated);
 
 export const cancelLuckinOrder = (order_id: string) =>

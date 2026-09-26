@@ -8,6 +8,7 @@ from .tool_approval_model import ToolApproval
 from .interest_model import InterestMention, InterestNode
 from .interest_community_model import InterestCommunity
 from .emotion_model import EmotionSnapshot
+from .luckin_order_model import LuckinOrderPreview, LuckinOrderRequest
 
 __all__ = [
     "User",
@@ -23,4 +24,6 @@ __all__ = [
     "InterestMention",
     "InterestCommunity",
     "EmotionSnapshot",
+    "LuckinOrderPreview",
+    "LuckinOrderRequest",
 ]

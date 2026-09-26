@@ -62,9 +62,16 @@ class CompareItem(BaseModel):
     dept_id: int | None = None
     shop: str
     distance_km: float | None = None
-    price: float | None = None
     product: str | None = None
     product_id: int | None = None
+    spec: str | None = None
+    original_price: float | None = None
+    actual_price: float | None = None
+    # 兼容旧前端展示的预估价别名
+    price: float | None = None
+    sellable: bool | None = None
+    fetched_at: str | None = None
+    source: str | None = None
     address: str | None = None
     status: str | None = None
     hours: str | None = None
@@ -90,6 +97,8 @@ class OrderCreateRequest(BaseModel):
     amount: int = Field(1, ge=1, le=20, description="数量")
     sku_code: str | None = Field(None, description="预览确认后的最终 sku(口味定稿)")
     remark: str = Field("", max_length=200, description="订单备注")
+    preview_id: UUID | None = Field(None, description="预览记录 id(服务端保存的规格/价格,防篡改)")
+    request_id: str | None = Field(None, max_length=64, description="客户端幂等键(重复点击/重试去重)")
 
 
 class OrderCancelRequest(BaseModel):

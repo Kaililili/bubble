@@ -33,6 +33,7 @@ function LuckinOrderModal({
   const [order, setOrder] = useState<OrderCreated | null>(null);
   const [phase, setPhase] = useState<"options" | "preview" | "pay">("options");
   const [loading, setLoading] = useState(false);
+  const [requestId, setRequestId] = useState("");
 
   useEffect(() => {
     if (!target) return;
@@ -71,6 +72,12 @@ function LuckinOrderModal({
 
   const handleNext = async () => {
     if (!options?.dept_id || !options.product_id) return;
+    // 每次预览/重新预览都换一个新的幂等键:一次「预览→确认」对应一个 request_id
+    setRequestId(
+      typeof crypto !== "undefined" && crypto.randomUUID
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(16).slice(2)}`
+    );
     setLoading(true);
     try {
       const p = await previewLuckinOrder({
@@ -96,15 +103,26 @@ function LuckinOrderModal({
         product_id: preview.product_id,
         amount: preview.amount ?? 1,
         sku_code: preview.sku_code,
+        preview_id: preview.preview_id,
+        request_id: requestId,
       });
       if (!res.order_id) {
+        if (res.status === "unknown" || res.status === "processing") {
+          message.warning(res.message || "订单状态未知,请稍后查询,不要重复下单");
+          return;
+        }
         message.error("下单失败,请重试");
         return;
       }
       setOrder(res);
       setPhase("pay");
     } catch (e) {
-      message.error((e as Error).message || "下单失败");
+      const msg = (e as Error).message || "下单失败";
+      message.error(msg);
+      // 价格/规格变化或预览过期:强制回到重新预览,不能拿旧参数直接下单
+      if (msg.includes("预览") || msg.includes("价格") || msg.includes("规格")) {
+        setPhase("options");
+      }
     } finally {
       setLoading(false);
     }

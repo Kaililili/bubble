@@ -143,6 +143,8 @@ async def create_order(
         body.amount,
         body.sku_code,
         body.remark,
+        body.request_id,
+        body.preview_id,
     )
     return success(data=data)
 
