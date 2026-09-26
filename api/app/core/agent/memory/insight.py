@@ -77,7 +77,10 @@ def format_insight_block(insights: list, limit: int = 5) -> str:
         lines.append(f"- {theme}:{content}" if theme else f"- {content}")
     if not lines:
         return ""
-    return "[对用户的整体理解](由历史记忆归纳,可被用户纠正)\n" + "\n".join(lines)
+    return (
+        "[对用户的整体理解](由历史记忆归纳,不是用户原话,可被用户纠正;"
+        "与 recall 检索到的现行记忆冲突时以现行记忆为准)\n" + "\n".join(lines)
+    )
 
 
 

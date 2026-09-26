@@ -58,5 +58,6 @@ def format_summary_block(summary: str, older_count: int) -> str:
         return ""
     return (
         f"[本会话早期对话摘要](已压缩 {older_count} 条较早消息,"
-        "细节可继续对话或让用户重申):\n" + text[:SUMMARY_MAX_CHARS]
+        "细节可继续对话或让用户重申;这是概括,可能过时,"
+        "与 recall 检索到的现行记忆冲突时以现行记忆为准):\n" + text[:SUMMARY_MAX_CHARS]
     )

@@ -16,11 +16,19 @@ REGISTRY: dict[str, "ToolSpec"] = {}
 class ToolContext:
     """工具执行上下文(会话/用户)"""
 
-    def __init__(self, session: AsyncSession, user_id: uuid.UUID, conversation_id=None):
+    def __init__(
+        self,
+        session: AsyncSession,
+        user_id: uuid.UUID,
+        conversation_id=None,
+        message_id=None,
+    ):
         self.session = session
         self.user_id = user_id
         # 会话 id:需要"结果异步写回对话"的工具会用到(如长任务受理后回填结果)
         self.conversation_id = conversation_id
+        # 当前这条用户消息 id:写入记忆时一并记下,回答个人事实时可回指原话(来源溯源)
+        self.message_id = message_id
 
 
 class ToolSpec:

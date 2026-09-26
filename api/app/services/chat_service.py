@@ -104,7 +104,6 @@ class ChatService:
 
         config = await get_default_config(self.session, user_id, "chat")
         model = build_chat_model(config)
-        tools = await build_enabled_tools(self.session, user_id, conversation_id)
         supports = bool(config.supports_function_call)
 
         # 先读历史(不含当前消息):只取最近一屏,更早的部分由滚动摘要代替
@@ -117,6 +116,16 @@ class ChatService:
             ("用户: " if r.role == "user" else "助手: ") + (r.content or "")
             for r in rows[-CONTEXT_MESSAGES:]
         ]
+
+        # 先持久化脱敏后的用户消息:拿到 message_id 后,工具写的记忆才能溯源到这次原话
+        # (历史里不保留凭证明文;当前消息仍用原文发给模型,让它读到真实值以调用工具)
+        safe_content = sanitize_credential_text(content)
+        user_message = await self.messages.create(conversation_id, role="user", content=safe_content)
+        self._pending_message_id = getattr(user_message, "id", None)
+        tools = await build_enabled_tools(
+            self.session, user_id, conversation_id, self._pending_message_id
+        )
+
         system_prompt = SYSTEM_PROMPT
         # ReAct 路径需要把工具说明渲染进系统提示词
         if not supports:
@@ -151,11 +160,6 @@ class ChatService:
             elif row.role == "assistant":
                 history.append(AIMessage(content=row.content))
         history.append(HumanMessage(content=content))
-
-        # 持久化脱敏后的用户消息(历史中不保留凭证明文)
-        safe_content = sanitize_credential_text(content)
-        user_message = await self.messages.create(conversation_id, role="user", content=safe_content)
-        self._pending_message_id = getattr(user_message, "id", None)
         if conv.title == "新对话":
             await self.conversations.update_title(conversation_id, title=safe_content[:20] or "新对话")
 
@@ -254,7 +258,7 @@ class ChatService:
 
         parts = [p for p in (intent.key, intent.type_word, intent.value) if p]
         content = " ".join(parts)
-        ctx = ToolContext(self.session, self._pending_user_id)
+        ctx = ToolContext(self.session, self._pending_user_id, message_id=self._pending_message_id)
         result = await remember(ctx, content=content, type=intent.type)
         ok = result.startswith(("已记住", "已更新"))
         tool_events.append(

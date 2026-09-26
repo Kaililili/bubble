@@ -23,6 +23,7 @@ from app.core.agent.plan.steps import step_collect_memories  # noqa: E402
 from app.core.agent.tools.base import ToolContext  # noqa: E402
 from app.core.agent.tools.builtin.memory_tools import (  # noqa: E402
     forget,
+    recall,
     remember,
     save_profile,
 )
@@ -32,7 +33,9 @@ from app.db.postgres import async_session, engine  # noqa: E402
 from app.models.memory_model import UserProfile  # noqa: E402
 from app.models.model_config_model import ModelConfig  # noqa: E402
 from app.models.user_model import User  # noqa: E402
+from app.repositories.conversation_repository import ConversationRepository  # noqa: E402
 from app.repositories.memory_repository import MemoryRepository  # noqa: E402
+from app.repositories.message_repository import MessageRepository  # noqa: E402
 from app.services.chat_service import ChatService  # noqa: E402
 from sqlalchemy import delete, select, text, update  # noqa: E402
 
@@ -178,6 +181,58 @@ async def _run() -> None:
             collected = await step_collect_memories(session, uid, {"days": 7}, {})
             assert all(i["type"] != "credential" for i in collected["data"]["items"])
             print("H. credential encrypted + excluded from review ok")
+
+            # I 来源溯源:记忆回指当次用户消息,recall 输出带证据;凭证不回指原话
+            conv = await ConversationRepository(session).create(uid, title="trace")
+            msg = await MessageRepository(session).create(
+                conv.id, role="user", content="帮我记住:我下周三面试字节"
+            )
+            trace_ctx = ToolContext(session, uid, conv.id, msg.id)
+            saved = await remember(trace_ctx, "我下周三面试字节")
+            assert saved.startswith("已记住"), saved
+            traced = await repo.find_active_by_content(uid, "fact", "我下周三面试字节")
+            assert traced is not None and traced.source == "chat", "来源类型没有落库"
+            assert traced.source_message_id == msg.id, "记忆没有回指当次用户消息"
+            evidence = await recall(trace_ctx, "面试")
+            assert "记忆ID" in evidence and "用户原话" in evidence, evidence
+            assert "下周三面试字节" in evidence and "来源 未知" not in evidence, evidence
+            await remember(trace_ctx, "招行 密码 zzz999888", type="credential")
+            cred_evidence = await recall(trace_ctx, "密码")
+            assert "zzz999888" not in cred_evidence, "recall 泄露了凭证明文"
+            assert "记忆ID" in cred_evidence
+            # 老数据(无来源)如实标注,不伪造用户原话
+            legacy = await repo.create(user_id=uid, type="fact", content="我是 2024 年毕业的")
+            legacy_evidence = await recall(trace_ctx, "毕业")
+            assert "来源 未知" in legacy_evidence, legacy_evidence
+            assert str(legacy.id)[:8] in legacy_evidence
+            print("I. memory source trace + recall evidence ok")
+
+            # J ReAct 路径回归:supports_function_call=False 时,工具说明必须渲染进 system prompt
+            # (prepare 里工具构建被移到消息落库之后,这里防止"变量未定义/顺序错"的回归)
+            from app.core.security import encrypt_secret
+
+            session.add(
+                ModelConfig(
+                    user_id=uid,
+                    model_type="chat",
+                    provider="openai",
+                    model_name="gpt-4o-mini",
+                    api_key_encrypted=encrypt_secret("dummy-key"),
+                    base_url="http://127.0.0.1:9/v1",
+                    supports_function_call=False,
+                    is_default=True,
+                )
+            )
+            await session.commit()
+            react_conv = await ConversationRepository(session).create(uid, title="react path")
+            svc = ChatService(session)
+            _model, react_tools, supports, history, _conv_id = await svc.prepare(
+                react_conv.id, uid, "帮我看看现在几点"
+            )
+            assert supports is False and react_tools, "ReAct 路径没有拿到工具"
+            assert "你有以下工具可用" in history[0].content, "工具说明没有渲染进 system prompt"
+            assert any(getattr(t, "name", "") == "recall" for t in react_tools)
+            print("J. react path renders tools prompt ok")
         finally:
             await session.execute(delete(User).where(User.id == uid))
             await session.commit()

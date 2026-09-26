@@ -77,10 +77,49 @@ def test_render_and_block() -> None:
     assert "new" in long_text and "old" not in long_text
     block = format_summary_block("用户在学 Rust,准备找后端岗", 12)
     assert "12" in block and "Rust" in block
+    assert "以现行记忆为准" in block
     assert format_summary_block("", 3) == ""
     assert format_summary_block(None, 3) == ""
     assert RECENT_WINDOW == 40
     print("render + block ok")
+
+
+def test_evidence_render() -> None:
+    """recall 证据渲染:带记忆 ID/状态/来源,凭证不回指原话,旧数据如实标未知"""
+    from app.core.agent.memory.retrieval import render_memory_evidence
+
+    assert "没有检索到" in render_memory_evidence([])
+    out = render_memory_evidence(
+        [
+            {
+                "memory_id": "8ce48ba8-1111-2222-3333-444455556666",
+                "type": "fact",
+                "content": "秋招优先城市=杭州",
+                "status": "active",
+                "status_label": "现行",
+                "source": "chat",
+                "source_label": "用户对话原话",
+                "quote": "现在改成优先杭州",
+                "quote_at": "2026-09-26 18:32",
+            },
+            {
+                "memory_id": "11111111-1111-1111-1111-111111111111",
+                "type": "credential",
+                "content": "招行 密码***",
+                "status": "active",
+                "status_label": "现行",
+                "source": "chat",
+                "source_label": "用户对话原话",
+                "quote": None,
+            },
+            {"memory_id": "abcdefgh", "type": "fact", "content": "旧记录"},
+        ]
+    )
+    assert "记忆ID 8ce48ba8" in out
+    assert "用户原话 2026-09-26 18:32" in out and "现在改成优先杭州" in out
+    assert "凭证" in out and "密码***" in out
+    assert out.count("来源 未知") == 1
+    print("evidence render ok")
 
 
 if __name__ == "__main__":
@@ -88,4 +127,5 @@ if __name__ == "__main__":
     test_context_window()
     test_summary_trigger()
     test_render_and_block()
+    test_evidence_render()
     print("ALL PASS")

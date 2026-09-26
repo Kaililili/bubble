@@ -321,7 +321,11 @@ async def step_persist(session, user_id, args: dict, deps: dict) -> dict:
     content = _clip(report.replace("\n", " "), 400)
     try:
         memory = await MemoryRepository(session).create(
-            user_id=user_id, type="event", content=f"个人回顾:{content}", importance=3
+            user_id=user_id,
+            type="event",
+            content=f"个人回顾:{content}",
+            importance=3,
+            source="review",  # 系统生成,不是用户原话:溯源里必须如实标注
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("review persist failed: %s", exc)

@@ -59,6 +59,10 @@ class Memory(Base):
     # 事实时效:active / superseded(被更新版本取代,保留可追溯)
     status: Mapped[str] = mapped_column(String(16), default="active", index=True)
     superseded_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    # 来源溯源:这条记忆是从哪来的(chat=用户对话原话 / review=系统回顾 / manual=手动添加)
+    # 聊天写入时记录当时的用户消息 id,回答个人事实问题时可以回指真实原话与时间
+    source: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    source_message_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     valid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_accessed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True

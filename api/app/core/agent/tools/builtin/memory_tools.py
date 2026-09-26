@@ -128,6 +128,10 @@ async def remember(ctx: ToolContext, content: str, type: str | None = None) -> s
     if same is not None:
         if embedding is not None:
             same.embedding = embedding
+        # 同一条事实再次被用户说起:来源指向最新那次原话,溯源更贴近现实
+        if ctx.message_id:
+            same.source = "chat"
+            same.source_message_id = ctx.message_id
         await repo.update(same)
         return f"已记住[{mtype}]:{display_content}(与既有记录一致,未重复保存)"
 
@@ -137,6 +141,8 @@ async def remember(ctx: ToolContext, content: str, type: str | None = None) -> s
         content=display_content,
         content_encrypted=content_encrypted,
         embedding=embedding,
+        source="chat" if ctx.message_id else "manual",
+        source_message_id=ctx.message_id,
     )
     # 事实时效:新事实可能让旧版本失效(凭证类不参与,它们按 key 覆盖)
     if mtype != "credential":
@@ -191,17 +197,16 @@ class RecallArgs(BaseModel):
 
 @register_tool(
     "recall",
-    "检索用户之前提到过的历史记忆。当需要用户过去的信息才能回答问题时调用。",
+    "检索用户之前提到过的历史记忆(只返回仍然有效的记录)。当需要用户过去的信息才能回答问题时调用。"
+    "返回内容含 记忆ID、状态与来源(用户原话/系统概括);引用个人事实时请带上这些证据标记,"
+    "没有检索到就如实说没有记录,不要凭印象编造。",
     RecallArgs,
 )
 async def recall(ctx: ToolContext, query: str) -> str:
-    from .....core.agent.memory.retrieval import search_memories
+    from .....core.agent.memory.retrieval import render_memory_evidence, search_memory_evidence
 
-    top = await search_memories(ctx.session, ctx.user_id, query, limit=6)
-    if not top:
-        return "没有检索到相关记忆。"
-    lines = [f"[{m.type}] {m.content}" for m in top]
-    return "\n".join(lines)
+    items = await search_memory_evidence(ctx.session, ctx.user_id, query, limit=6)
+    return render_memory_evidence(items)
 
 
 class ForgetArgs(BaseModel):

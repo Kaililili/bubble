@@ -21,6 +21,8 @@ ALTER_STATEMENTS = (
     "ALTER TABLE memories ADD COLUMN IF NOT EXISTS status VARCHAR(16) DEFAULT 'active'",
     "ALTER TABLE memories ADD COLUMN IF NOT EXISTS superseded_by UUID",
     "ALTER TABLE memories ADD COLUMN IF NOT EXISTS valid_at TIMESTAMPTZ",
+    "ALTER TABLE memories ADD COLUMN IF NOT EXISTS source VARCHAR(16)",
+    "ALTER TABLE memories ADD COLUMN IF NOT EXISTS source_message_id UUID",
     "ALTER TABLE interest_nodes ADD COLUMN IF NOT EXISTS entity_type VARCHAR(32)",
 )
 

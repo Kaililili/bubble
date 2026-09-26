@@ -107,6 +107,8 @@ class MemoryRepository:
         content_encrypted: str | None = None,
         embedding: list | None = None,
         importance: int = 0,
+        source: str | None = None,
+        source_message_id: UUID | None = None,
     ) -> Memory:
         memory = Memory(
             user_id=user_id,
@@ -115,6 +117,8 @@ class MemoryRepository:
             content_encrypted=content_encrypted,
             embedding=embedding,
             importance=importance,
+            source=source,
+            source_message_id=source_message_id,
         )
         self.session.add(memory)
         await self.session.commit()
