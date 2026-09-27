@@ -107,6 +107,13 @@ async def _active(session, user_id):
     }
 
 
+async def _snapshot(session, user_id):
+    return {
+        m.content: m
+        for m in await MemoryRepository(session).list_by_user(user_id)
+    }
+
+
 async def _run() -> None:
     from app.core.llm import client as llm_client
     from app.core.llm import embedding as llm_embedding
@@ -242,6 +249,40 @@ async def _run() -> None:
             active = await _active(session, uid)
             assert {"明天交周报", "明天开会"} <= set(active), active
             print("9. event/todo not fact-superseded ok")
+
+            # 10. 同属性超过 6 条,目标旧事实仍被召回(合并后确定性排序,不是按插入顺序截断)
+            close = [1.0] + [0.0] * 1023
+            far = [0.0] * 1023 + [1.0]
+            target = await repo.create(
+                user_id=uid, type="fact", content="目标杭州", embedding=close, attribute="求职意向城市"
+            )
+            for i in range(7):
+                await repo.create(
+                    user_id=uid,
+                    type="fact",
+                    content=f"求职候选{i}",
+                    embedding=far,
+                    attribute="求职意向城市",
+                )
+            recalled = await repo.find_update_candidates(
+                uid, "fact", "求职意向城市", None, close, "现在更想去杭州", limit=6
+            )
+            assert target.id in {m.id for m in recalled}, "同属性候选超限时目标旧事实被截掉"
+            assert target.id == recalled[0].id, "向量最相近的目标应排第一"
+            print("10. same-attribute overflow keeps target via ranking ok")
+
+            # 11. 重复写入保留首次 source_message_id(不覆盖为最新)
+            m1 = uuid.uuid4()
+            await remember(ToolContext(session, uid, None, m1), "我喜欢喝咖啡", type="fact")
+            first = (await _snapshot(session, uid))["我喜欢喝咖啡"]
+            assert first.source_message_id == m1 and first.source == "chat"
+            m2 = uuid.uuid4()
+            result = await remember(ToolContext(session, uid, None, m2), "我喜欢喝咖啡", type="fact")
+            assert "与既有记录一致" in result, result
+            again = (await _snapshot(session, uid))["我喜欢喝咖啡"]
+            assert again.source_message_id == m1, "重复写入覆盖了首次 source_message_id"
+            assert again.source == "chat"
+            print("11. duplicate preserves first source_message_id ok")
         finally:
             await session.execute(delete(User).where(User.id == uid))
             await session.commit()

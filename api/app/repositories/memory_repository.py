@@ -1,4 +1,5 @@
 """记忆数据访问层:用户背景 + 长尾记忆"""
+import math
 import re
 from datetime import datetime, timezone
 from uuid import UUID
@@ -286,12 +287,14 @@ class MemoryRepository:
         keyword: str | None = None,
         limit: int = 20,
         include_superseded: bool = False,
+        type: str | None = None,
     ) -> list[tuple[Memory, float | None]]:
         """召回候选池:向量相似度 + 关键词,供融合排序使用。
 
         返回 [(记忆, 向量相似度 or None)];纯关键词命中的条目相似度为 None。
         """
         pool: dict = {}
+        type_cond = (Memory.type == type,) if type else ()
         if query_vector is not None:
             result = await self.session.execute(
                 select(
@@ -301,19 +304,24 @@ class MemoryRepository:
                 .where(
                     Memory.user_id == user_id,
                     Memory.embedding.is_not(None),
+                    *type_cond,
                     *(() if include_superseded else (Memory.status == "active",)),
                 )
                 .order_by(Memory.embedding.cosine_distance(query_vector))
                 .limit(limit)
             )
             for memory, similarity in result.all():
-                pool[memory.id] = (memory, float(similarity))
+                sim = float(similarity) if similarity is not None else 0.0
+                if math.isnan(sim):
+                    sim = 0.0  # 零向量/退化向量会得到 NaN 距离,按无相似度处理
+                pool[memory.id] = (memory, sim)
         if keyword:
             result = await self.session.execute(
                 select(Memory)
                 .where(
                     Memory.user_id == user_id,
                     Memory.content.ilike(f"%{keyword}%"),
+                    *type_cond,
                     *(() if include_superseded else (Memory.status == "active",)),
                 )
                 .order_by(Memory.created_at.desc())
@@ -333,11 +341,35 @@ class MemoryRepository:
         content: str,
         limit: int = 6,
     ) -> list[Memory]:
-        """事实更新用的混合召回:属性匹配优先,再合并向量 + 文本;去重,设上限。
+        """合并属性/适用范围/向量/文本候选,按相关度做**确定性排序**后再截断。
 
-        只在同用户、同类型、active 里找;旧记录 attribute 为空时仍可经向量/文本召回。
+        只在同用户、同类型、active 里找。属性/适用范围命中是加分项,不是覆盖依据;
+        排序键 = 向量相似度 + 属性命中加分 + 适用范围命中加分 + 文本命中加分,
+        最后用创建时间与 id 做确定性 tie-break。这样即使同属性记录超过 limit,
+        向量最相近或文本命中的目标旧事实也不会被顺序截掉。
         """
-        pool: dict = {}
+        from ..core.agent.memory.supersede import normalize_fact
+
+        norm_content = normalize_fact(content)
+        entries: dict = {}  # memory.id -> {memory, attr, scope, sim, text}
+
+        def add(memory, *, attr=False, scope=False, sim=None, text=0) -> None:
+            entry = entries.get(memory.id)
+            if entry is None:
+                entries[memory.id] = {
+                    "memory": memory,
+                    "attr": attr,
+                    "scope": scope,
+                    "sim": sim,
+                    "text": text,
+                }
+                return
+            entry["attr"] = entry["attr"] or attr
+            entry["scope"] = entry["scope"] or scope
+            if sim is not None and (entry["sim"] is None or sim > entry["sim"]):
+                entry["sim"] = sim
+            entry["text"] = max(entry["text"], text)
+
         if attribute:
             result = await self.session.execute(
                 select(Memory).where(
@@ -346,15 +378,55 @@ class MemoryRepository:
                     Memory.status == "active",
                     Memory.attribute == attribute,
                 )
+                .limit(100)
             )
             for memory in result.scalars().all():
-                pool[memory.id] = memory
+                add(memory, attr=True, scope=bool(scope) and memory.scope == scope)
+
+        if scope:
+            result = await self.session.execute(
+                select(Memory).where(
+                    Memory.user_id == user_id,
+                    Memory.type == type,
+                    Memory.status == "active",
+                    Memory.scope == scope,
+                )
+                .limit(100)
+            )
+            for memory in result.scalars().all():
+                add(memory, scope=True, attr=bool(attribute) and memory.attribute == attribute)
+
+        # 向量 + 文本(把关键词检索上限放大,避免排序前就丢掉向量命中的关键旧事实)
         candidates = await self.search_candidates(
-            user_id, embedding, content, limit=limit, include_superseded=False
+            user_id,
+            embedding,
+            content,
+            limit=limit * 4,
+            include_superseded=False,
+            type=type,
         )
-        for memory, _similarity in candidates:
-            pool.setdefault(memory.id, memory)
-        return list(pool.values())[:limit]
+        for memory, similarity in candidates:
+            norm_old = normalize_fact(memory.content or "")
+            text = 2 if norm_old == norm_content else (
+                1 if norm_content and (norm_content in norm_old or norm_old in norm_content) else 0
+            )
+            add(memory, sim=similarity, text=text)
+
+        def sort_key(entry):
+            sim = entry["sim"]
+            if sim is None or math.isnan(sim):
+                sim = 0.0
+            score = (
+                sim
+                + 0.5 * (1 if entry["attr"] else 0)
+                + 0.25 * (1 if entry["scope"] else 0)
+                + 0.5 * entry["text"]
+            )
+            created = entry["memory"].created_at or datetime(1970, 1, 1, tzinfo=timezone.utc)
+            return (score, created, str(entry["memory"].id))
+
+        ranked = sorted(entries.values(), key=sort_key, reverse=True)
+        return [entry["memory"] for entry in ranked][:limit]
 
     async def touch_accessed(self, memories: list[Memory]) -> None:
         """命中回写:访问次数 +1、记录最近访问时间(供融合排序与后续分层巩固)"""

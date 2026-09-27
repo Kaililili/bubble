@@ -167,8 +167,10 @@ async def upsert_fact(
     if same is not None:
         if embedding is not None:
             same.embedding = embedding
-        if source_message_id:
+        # 保留首次来源:只在缺失时补,不覆盖既有 source_message_id
+        if same.source is None:
             same.source = source
+        if same.source_message_id is None:
             same.source_message_id = source_message_id
         await repo.update(same)
         return "reused", same, []
@@ -200,8 +202,9 @@ async def upsert_fact(
         ):
             if embedding is not None:
                 old.embedding = embedding
-            if source_message_id:
+            if old.source is None:
                 old.source = source
+            if old.source_message_id is None:
                 old.source_message_id = source_message_id
             await repo.update(old)
             return "reused", old, []
