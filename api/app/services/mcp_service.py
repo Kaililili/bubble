@@ -257,9 +257,26 @@ class MCPService:
             await _fail_request("预览已过期")
             raise AppException(code=400, message="预览已过期,请重新预览")
 
-        # 用服务端保存的 sku/specs 下单(不重复开 MCP 会话二次预览:
-        # 二次预览既拖慢下单,又会在服务端会话不稳时把整笔下单误判成失败)。
-        # 价格/规格变化通过 TTL 过期 + 下单结果的 discount_price 与预览价对比来暴露。
+        # 价格/规格复核:尽量再查一次。确认不一致 → 立即停止下单(要求重新预览);
+        # 复核本身读不到(超时/服务抖动) → 放行,由预览 TTL 与下单结果 price_changed 兜底。
+        from ..core.agent.tools.mcp.luckin_compare import run_order_preview
+
+        fresh = await run_order_preview(
+            self.session,
+            user_id,
+            preview.dept_id,
+            preview.product_id,
+            preview.amount,
+            preview.specs,
+        )
+        if "error" not in fresh:
+            price_changed = fresh.get("discount_price") != preview.discount_price
+            sku_changed = fresh.get("sku_code") != preview.sku_code
+            if price_changed or sku_changed:
+                await _fail_request("价格或规格已变化")
+                raise AppException(code=409, message="价格或规格已发生变化,请重新预览确认")
+
+        # 用服务端保存的 sku/specs 下单(前端传的价格/参数一律不用)
         result = await run_order_create(
             self.session,
             user_id,

@@ -129,7 +129,21 @@ async def _run() -> None:
             assert _STATE["create_calls"] == 1, "价格变化仍执行了下单"
             print("C1. expired preview blocked, no order created ok")
 
-            # ── 价格变化:下单后显式标注(订单已生成,前端据此提示) ──
+            # ── 复核价格变化:立即停止下单,要求重新预览 ──
+            _STATE["price"] = 20.0
+            pv_pre = await svc.preview_order(uid, dept_id=100, product_id=200, amount=1)
+            _STATE["price"] = 21.0  # 复核时价格变了
+            try:
+                await svc.create_order(
+                    uid, 100, 200, 1, request_id="req-pre", preview_id=uuid.UUID(pv_pre["preview_id"])
+                )
+                raise AssertionError("复核价格变化没有拦截")
+            except AppException as exc:
+                assert exc.code == 409 and "价格" in str(exc), exc
+            assert _STATE["create_calls"] == 1, "复核价格变化仍执行了下单"
+            print("C1.5. recheck price change blocks order ok")
+
+            # ── 下单结果价与预览价不一致:订单已生成,显式标注 ──
             _STATE["price"] = 20.0
             pv3 = await svc.preview_order(uid, dept_id=100, product_id=200, amount=1)
             _STATE["create_result"] = {"order_id": "O2", "discount_price": 25.0}

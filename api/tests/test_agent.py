@@ -136,6 +136,45 @@ async def main():
     assert any(e.get("type") == "final" and e.get("phase") == "final" for e in events4)
     print("== run_id/phase trace ok ==")
 
+    # 6. 运行轨迹脱敏:只留阶段/工具名/状态/耗时,不落参数/全文/token 正文
+    from app.services.chat_service import _sanitize_trace_event
+
+    sanitized = _sanitize_trace_event(
+        {
+            "type": "tool_result",
+            "tool": "recall",
+            "query": "我的密码",
+            "text": "x",
+            "full_text": "secret-full",
+            "args": {"pwd": "123"},
+            "status": "success",
+            "latency_ms": 5,
+            "run_id": "r1",
+            "phase": "tool",
+        }
+    )
+    assert sanitized == {
+        "type": "tool_result",
+        "phase": "tool",
+        "run_id": "r1",
+        "tool": "recall",
+        "status": "success",
+        "latency_ms": 5,
+    }, sanitized
+    assert "args" not in sanitized and "query" not in sanitized and "full_text" not in sanitized
+    assert _sanitize_trace_event({"type": "token", "text": "secret"}) is None
+    model_ev = _sanitize_trace_event(
+        {
+            "type": "model_result",
+            "latency_ms": 3,
+            "model": {"provider": "x", "model": "y"},
+            "run_id": "r1",
+            "phase": "model",
+        }
+    )
+    assert model_ev["latency_ms"] == 3 and model_ev["model"]["provider"] == "x"
+    print("== trace sanitize ok ==")
+
     print("ALL PASS")
 
 

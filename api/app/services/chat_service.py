@@ -27,6 +27,35 @@ logger = logging.getLogger(__name__)
 # 用户背景注入 system prompt 的长度护栏(约 800 token,防止背景撑爆上下文)
 MAX_PROFILE_CHARS = 1600
 
+# 运行轨迹里允许持久化的事件类型(不存 token 正文/提示词/工具参数/工具全文)
+_TRACE_TYPES = {"model_result", "tool_start", "tool_result", "tool_approval_required", "error"}
+
+
+def _sanitize_trace_event(event: dict) -> dict | None:
+    """把 SSE 事件压成可持久化的最小轨迹(只留阶段/工具名/状态/耗时,不含敏感字段)"""
+    event_type = event.get("type")
+    if event_type not in _TRACE_TYPES:
+        return None
+    entry: dict = {
+        "type": event_type,
+        "phase": event.get("phase"),
+        "run_id": event.get("run_id"),
+    }
+    if event_type == "model_result":
+        entry["latency_ms"] = event.get("latency_ms")
+        entry["model"] = event.get("model") or {}
+    elif event_type in ("tool_start", "tool_result"):
+        entry["tool"] = event.get("tool")
+        if event_type == "tool_result":
+            entry["status"] = event.get("status")
+            entry["latency_ms"] = event.get("latency_ms")
+    elif event_type == "tool_approval_required":
+        entry["tool"] = event.get("tool")
+        entry["approval_id"] = event.get("approval_id")
+    elif event_type == "error":
+        entry["message"] = (event.get("message") or "")[:300]
+    return entry
+
 
 class ChatService:
     def __init__(self, session: AsyncSession):
@@ -299,6 +328,7 @@ class ChatService:
         )
         full_text = ""
         tool_events = []
+        trace_events = []
         error_message = ""
         error_sent = False
         # 先告知客户端本次 run_id(不改变原有消息结构)
@@ -339,6 +369,9 @@ class ChatService:
                             "status": "pending",
                         }
                     )
+                trace_entry = _sanitize_trace_event(event)
+                if trace_entry is not None:
+                    trace_events.append(trace_entry)
                 yield json.dumps(event, ensure_ascii=False)
         finally:
             if not task.done():
@@ -362,7 +395,7 @@ class ChatService:
                     role="assistant",
                     content=full_text,
                     tool_calls={"events": tool_events} if tool_events else None,
-                    metadata={"run_id": self._pending_run_id},
+                    metadata={"run_id": self._pending_run_id, "trace": trace_events},
                 )
             await self.conversations.touch(conversation_id)
             await self._schedule_interest_extraction(conversation_id)

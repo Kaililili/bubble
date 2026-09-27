@@ -31,7 +31,12 @@ def _format_reply(result: dict) -> str:
 
 
 async def _write_back(
-    session, user_id: UUID, conversation_id: UUID | None, content: str, review_run_id: str | None = None
+    session,
+    user_id: UUID,
+    conversation_id: UUID | None,
+    content: str,
+    review_run_id: str | None = None,
+    origin_run_id: str | None = None,
 ) -> None:
     """把结果作为一条助手消息写回会话(顺带刷新会话活跃时间)"""
     if conversation_id is None:
@@ -51,6 +56,7 @@ async def _write_back(
             "source": "weekly_review",
             "async": True,
             "review_run_id": review_run_id,
+            "origin_run_id": origin_run_id,
         },
     )
     conversation.updated_at = datetime.now(timezone.utc)
@@ -58,7 +64,11 @@ async def _write_back(
 
 
 async def run_generate_review(
-    user_id: UUID, conversation_id: UUID | None = None, days: int = WINDOW_DAYS, persist: bool = True
+    user_id: UUID,
+    conversation_id: UUID | None = None,
+    days: int = WINDOW_DAYS,
+    persist: bool = True,
+    origin_run_id: str | None = None,
 ) -> dict:
     """任务体(独立函数,便于直接测试):跑 Plan-Execute 图 → 写回会话消息"""
     from ..core.agent.plan import run_review
@@ -70,7 +80,12 @@ async def run_generate_review(
             result = await run_review(session, user_id, days=int(days), persist=bool(persist))
             reply = _format_reply(result)
             await _write_back(
-                session, user_id, conversation_id, reply, result.get("review_run_id")
+                session,
+                user_id,
+                conversation_id,
+                reply,
+                result.get("review_run_id"),
+                origin_run_id,
             )
             logger.info(
                 "review generated for %s: report=%s chars, replans=%s, degraded=%s",
@@ -91,7 +106,11 @@ async def run_generate_review(
 
 @shared_task(name="review.generate")
 def generate_review_task(
-    user_id: str, conversation_id: str | None = None, days: int = WINDOW_DAYS, persist: bool = True
+    user_id: str,
+    conversation_id: str | None = None,
+    days: int = WINDOW_DAYS,
+    persist: bool = True,
+    origin_run_id: str | None = None,
 ) -> dict:
     """单用户回顾:celery 入口(逻辑在 run_generate_review)"""
     return run_async(
@@ -100,6 +119,7 @@ def generate_review_task(
             UUID(str(conversation_id)) if conversation_id else None,
             int(days),
             bool(persist),
+            origin_run_id,
         )
     )
 

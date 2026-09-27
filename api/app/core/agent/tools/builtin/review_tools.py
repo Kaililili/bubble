@@ -67,6 +67,7 @@ async def weekly_review(ctx: ToolContext, days: int = 7, persist: bool = False) 
                 str(ctx.conversation_id) if ctx.conversation_id else None,
                 int(days),
                 bool(persist),
+                str(ctx.run_id) if ctx.run_id else None,
             ],
         )
     except Exception as exc:  # noqa: BLE001  队列不可用时同步兜底,保证功能可用
