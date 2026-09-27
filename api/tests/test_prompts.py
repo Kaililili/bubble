@@ -12,13 +12,14 @@ from app.prompts import (
     ENTITY_JUDGE_PROMPT,
     EXTRACT_GLEAN_PROMPT,
     EXTRACT_SYSTEM_PROMPT,
+    FACT_ATTRIBUTE_PROMPT,
+    FACT_RELATION_PROMPT,
     PROMPT_REGISTRY,
     REFLECT_PROMPT,
     REVIEW_ANALYZE_PROMPT,
     REVIEW_COMPOSE_PROMPT,
     REVIEW_PLAN_PROMPT,
     SUMMARY_PROMPT,
-    SUPERSEDE_PROMPT,
     build_emotion_prompt,
 )
 
@@ -31,7 +32,8 @@ TEXTS = {
     "interest.community_summary": COMMUNITY_SUMMARY_PROMPT,
     "memory.summary": SUMMARY_PROMPT,
     "memory.reflect": REFLECT_PROMPT,
-    "memory.supersede": SUPERSEDE_PROMPT,
+    "memory.fact_attribute": FACT_ATTRIBUTE_PROMPT,
+    "memory.fact_relation": FACT_RELATION_PROMPT,
     "review.plan": REVIEW_PLAN_PROMPT,
     "review.analyze": REVIEW_ANALYZE_PROMPT,
     "review.compose": REVIEW_COMPOSE_PROMPT,
@@ -59,8 +61,11 @@ def test_key_constraints_present() -> None:
     assert "原样摘抄" in EXTRACT_SYSTEM_PROMPT
     # 实体/关系类型白名单渲染进提示词
     assert "broader" in EXTRACT_SYSTEM_PROMPT and "member_of" in EXTRACT_SYSTEM_PROMPT
-    # 时效裁决必须要求只输出 SUPERSEDE / KEEP
-    assert "SUPERSEDE" in SUPERSEDE_PROMPT and "KEEP" in SUPERSEDE_PROMPT
+    # 事实更新判定必须给出四种关系,并强调"属性相同不等于覆盖"
+    for relation in ("SUPERSEDE", "COEXIST", "DUPLICATE", "UNCERTAIN"):
+        assert relation in FACT_RELATION_PROMPT
+    assert "绝不直接等于" in FACT_RELATION_PROMPT
+    assert "attribute" in FACT_ATTRIBUTE_PROMPT
     # 情绪提示词必须带受控词表与维度定义
     emo = build_emotion_prompt()
     assert "valence" in emo and "arousal" in emo and "emotion_type" in emo

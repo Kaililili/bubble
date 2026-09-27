@@ -109,6 +109,8 @@ class MemoryRepository:
         importance: int = 0,
         source: str | None = None,
         source_message_id: UUID | None = None,
+        attribute: str | None = None,
+        scope: str | None = None,
     ) -> Memory:
         memory = Memory(
             user_id=user_id,
@@ -119,10 +121,38 @@ class MemoryRepository:
             importance=importance,
             source=source,
             source_message_id=source_message_id,
+            attribute=attribute,
+            scope=scope,
         )
         self.session.add(memory)
         await self.session.commit()
         await self.session.refresh(memory)
+        return memory
+
+    async def insert_fact(
+        self,
+        *,
+        user_id: UUID,
+        content: str,
+        embedding: list | None = None,
+        source: str | None = None,
+        source_message_id: UUID | None = None,
+        attribute: str | None = None,
+        scope: str | None = None,
+    ) -> Memory:
+        """创建普通事实但**只 flush 不 commit**,供 upsert_fact 在同一事务里标记 superseded"""
+        memory = Memory(
+            user_id=user_id,
+            type="fact",
+            content=content,
+            embedding=embedding,
+            source=source,
+            source_message_id=source_message_id,
+            attribute=attribute,
+            scope=scope,
+        )
+        self.session.add(memory)
+        await self.session.flush()
         return memory
 
     async def list_by_user(
@@ -292,6 +322,39 @@ class MemoryRepository:
             for memory in result.scalars().all():
                 pool.setdefault(memory.id, (memory, None))
         return list(pool.values())
+
+    async def find_update_candidates(
+        self,
+        user_id: UUID,
+        type: str,
+        attribute: str | None,
+        scope: str | None,
+        embedding: list | None,
+        content: str,
+        limit: int = 6,
+    ) -> list[Memory]:
+        """事实更新用的混合召回:属性匹配优先,再合并向量 + 文本;去重,设上限。
+
+        只在同用户、同类型、active 里找;旧记录 attribute 为空时仍可经向量/文本召回。
+        """
+        pool: dict = {}
+        if attribute:
+            result = await self.session.execute(
+                select(Memory).where(
+                    Memory.user_id == user_id,
+                    Memory.type == type,
+                    Memory.status == "active",
+                    Memory.attribute == attribute,
+                )
+            )
+            for memory in result.scalars().all():
+                pool[memory.id] = memory
+        candidates = await self.search_candidates(
+            user_id, embedding, content, limit=limit, include_superseded=False
+        )
+        for memory, _similarity in candidates:
+            pool.setdefault(memory.id, memory)
+        return list(pool.values())[:limit]
 
     async def touch_accessed(self, memories: list[Memory]) -> None:
         """命中回写:访问次数 +1、记录最近访问时间(供融合排序与后续分层巩固)"""

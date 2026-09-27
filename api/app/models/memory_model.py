@@ -59,6 +59,10 @@ class Memory(Base):
     # 事实时效:active / superseded(被更新版本取代,保留可追溯)
     status: Mapped[str] = mapped_column(String(16), default="active", index=True)
     superseded_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    # 事实更新用:规范化的"事实属性"(如 求职意向城市/兴趣爱好)与可选适用范围。
+    # 用于寻找候选,但属性相同绝不直接等于覆盖;旧记录这两列为空也能参与召回(向量/文本兜底)。
+    attribute: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    scope: Mapped[str | None] = mapped_column(String(100), nullable=True)
     # 来源溯源:这条记忆是从哪来的(chat=用户对话原话 / review=系统回顾 / manual=手动添加)
     # 聊天写入时记录当时的用户消息 id,回答个人事实问题时可以回指真实原话与时间
     source: Mapped[str | None] = mapped_column(String(16), nullable=True)

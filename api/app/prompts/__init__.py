@@ -22,9 +22,10 @@ from .review import (
     VERSION as REVIEW_VERSION,
 )
 from .memory import (
+    FACT_ATTRIBUTE_PROMPT,
+    FACT_RELATION_PROMPT,
     REFLECT_PROMPT,
     SUMMARY_PROMPT,
-    SUPERSEDE_PROMPT,
     VERSION as MEMORY_VERSION,
 )
 
@@ -38,7 +39,8 @@ PROMPT_REGISTRY: dict[str, str] = {
     "emotion.analyze": EMOTION_VERSION,
     "memory.summary": MEMORY_VERSION,
     "memory.reflect": MEMORY_VERSION,
-    "memory.supersede": MEMORY_VERSION,
+    "memory.fact_attribute": MEMORY_VERSION,
+    "memory.fact_relation": MEMORY_VERSION,
     "review.plan": REVIEW_VERSION,
     "review.analyze": REVIEW_VERSION,
     "review.compose": REVIEW_VERSION,
@@ -51,12 +53,13 @@ __all__ = [
     "ENTITY_JUDGE_PROMPT",
     "EXTRACT_GLEAN_PROMPT",
     "EXTRACT_SYSTEM_PROMPT",
+    "FACT_ATTRIBUTE_PROMPT",
+    "FACT_RELATION_PROMPT",
     "PROMPT_REGISTRY",
     "REFLECT_PROMPT",
     "REVIEW_ANALYZE_PROMPT",
     "REVIEW_COMPOSE_PROMPT",
     "REVIEW_PLAN_PROMPT",
     "SUMMARY_PROMPT",
-    "SUPERSEDE_PROMPT",
     "build_emotion_prompt",
 ]

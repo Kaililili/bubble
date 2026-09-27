@@ -1,238 +1,247 @@
-"""Stage-1 DB integration check: fact update / idempotency / forget / review filter / stale profile.
+"""阶段一(重写)DB 集成自测:显式 remember 普通事实的更新流程。
 
-Needs local Postgres (same .env as runtime). Creates one temp user, deletes it afterwards.
-Run: python api/tests/test_memory_active_db.py
+用脚本化模型(属性提取 + 关系判定)和脚本化 embedding 替代真实 LLM/向量,
+只验证"最终数据库状态、superseded_by 关系、当前检索结果",不测模型标签本身。
+真实模型/向量的开放措辞验收见 _staging/verify_fact_update.py。
 """
 import asyncio
+import json
 import logging
 import sys
 import uuid
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-# 关掉 SQL echo(DEBUG=true 时默认打开),只留断言结果
-logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
 
-from app.core.agent.memory.retrieval import search_memories  # noqa: E402
-from app.core.agent.memory.supersede import apply_supersede  # noqa: E402
-from app.core.agent.plan.steps import step_collect_memories  # noqa: E402
 from app.core.agent.tools.base import ToolContext  # noqa: E402
-from app.core.agent.tools.builtin.memory_tools import (  # noqa: E402
-    forget,
-    recall,
-    remember,
-    save_profile,
-)
-from app.core.llm.client import build_chat_model  # noqa: E402
-from app.core.security import hash_password  # noqa: E402
+from app.core.agent.tools.builtin.memory_tools import remember  # noqa: E402
+from app.core.security import encrypt_secret, hash_password  # noqa: E402
 from app.db.postgres import async_session, engine  # noqa: E402
-from app.models.memory_model import UserProfile  # noqa: E402
 from app.models.model_config_model import ModelConfig  # noqa: E402
 from app.models.user_model import User  # noqa: E402
-from app.repositories.conversation_repository import ConversationRepository  # noqa: E402
 from app.repositories.memory_repository import MemoryRepository  # noqa: E402
-from app.repositories.message_repository import MessageRepository  # noqa: E402
-from app.services.chat_service import ChatService  # noqa: E402
-from sqlalchemy import delete, select, text, update  # noqa: E402
+from sqlalchemy import delete  # noqa: E402
 
-# DEBUG=true 时引擎默认回显 SQL;测试只关心断言结果,这里关掉
 engine.echo = False
 logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
 
 
-async def _borrow_chat_model(session):
-    """借一份**可用的** chat 配置当裁决模型(逐个探测,不打印任何密钥)"""
-    from langchain_core.messages import HumanMessage
+class ScriptedChat:
+    """脚本化 chat 模型:按内容返回属性/关系,或按标记抛错模拟模型失败"""
 
-    configs = (
-        await session.execute(
-            select(ModelConfig).where(ModelConfig.model_type == "chat").limit(8)
+    def __init__(self) -> None:
+        self.attributes: dict = {}
+        self.relations: dict = {}
+        self.fail_for: set = set()
+
+    def set_attr(self, content: str, attribute: str | None, scope: str | None = None) -> None:
+        self.attributes[content] = {"attribute": attribute, "scope": scope}
+
+    def set_relation(self, new_content: str, relations: list[dict]) -> None:
+        self.relations[new_content] = relations
+
+    async def ainvoke(self, messages):
+        prompt = messages[-1].content
+        if "事实属性提取器" in prompt:
+            for content, attr in self.attributes.items():
+                if f"事实内容:{content}" in prompt:
+                    if content in self.fail_for:
+                        raise RuntimeError("scripted attribute failure")
+                    return SimpleNamespace(content=json.dumps(attr, ensure_ascii=False))
+            return SimpleNamespace(content=json.dumps({"attribute": None, "scope": None}, ensure_ascii=False))
+        if "记忆更新判定器" in prompt:
+            for content, rels in self.relations.items():
+                if f"新事实:{content}" in prompt:
+                    if content in self.fail_for:
+                        raise RuntimeError("scripted relation failure")
+                    return SimpleNamespace(content=json.dumps({"relations": rels}, ensure_ascii=False))
+            return SimpleNamespace(content=json.dumps({"relations": []}, ensure_ascii=False))
+        return SimpleNamespace(content="{}")
+
+
+class ScriptedEmbedder:
+    """脚本化 embedding:内容 → 固定 1024 维向量,模拟"语义相近"的召回"""
+
+    def __init__(self, mapping: dict[str, list]) -> None:
+        self.mapping = mapping
+        self.default = [0.0] * 1024
+
+    async def aembed_query(self, text: str) -> list:
+        return self.mapping.get(text, self.default)
+
+
+async def _setup(session):
+    username = f"codex_fact_{uuid.uuid4().hex[:6]}"
+    user = User(username=username, email=f"{username}@test.local", hashed_password=hash_password("x"))
+    session.add(user)
+    await session.commit()
+    await session.refresh(user)
+    for model_type, provider, model_name in (
+        ("chat", "deepseek", "deepseek-chat"),
+        ("embedding", "siliconflow", "BAAI/bge-m3"),
+    ):
+        session.add(
+            ModelConfig(
+                user_id=user.id,
+                model_type=model_type,
+                provider=provider,
+                model_name=model_name,
+                api_key_encrypted=encrypt_secret("dummy"),
+                base_url="http://127.0.0.1:9/v1",
+                supports_function_call=True,
+                is_default=True,
+            )
         )
-    ).scalars().all()
-    for config in configs:
-        try:
-            model = build_chat_model(config, streaming=False, temperature=0)
-            await asyncio.wait_for(model.ainvoke([HumanMessage(content="ping")]), timeout=30)
-            print(f"borrowed chat model: {config.provider}/{config.model_name}")
-            return model
-        except Exception as exc:  # noqa: BLE001
-            print(f"chat config unusable ({config.provider}): {type(exc).__name__}")
-    return None
+    await session.commit()
+    return user
+
+
+async def _active(session, user_id):
+    return {
+        m.content: m
+        for m in await MemoryRepository(session).list_by_user(user_id)
+        if m.status == "active"
+    }
 
 
 async def _run() -> None:
-    username = f"codex_stage1_{uuid.uuid4().hex[:8]}"
+    from app.core.llm import client as llm_client
+    from app.core.llm import embedding as llm_embedding
+
+    chat = ScriptedChat()
+    embedder = ScriptedEmbedder({})
+    llm_client.build_chat_model = lambda config, **kwargs: chat
+    llm_embedding.build_embedding_model = lambda config: embedder
+
     async with async_session() as session:
-        null_status = (
-            await session.execute(text("select count(*) from memories where status is null"))
-        ).scalar_one()
-        assert not null_status, f"existing memories with NULL status would be missed: {null_status}"
-
-        user = User(
-            username=username,
-            email=f"{username}@test.local",
-            hashed_password=hash_password("x"),
-        )
-        session.add(user)
-        await session.commit()
-        await session.refresh(user)
+        user = await _setup(session)
         uid = user.id
-        repo = MemoryRepository(session)
         ctx = ToolContext(session, uid)
+        repo = MemoryRepository(session)
         try:
-            # background first: "常驻城市: 上海", updated_at pushed one hour back
-            await save_profile(ctx, "常驻城市", "上海")
-            await session.execute(
-                update(UserProfile)
-                .where(UserProfile.user_id == uid, UserProfile.key == "常驻城市")
-                .values(updated_at=datetime.now(timezone.utc) - timedelta(hours=1))
-            )
-            await session.commit()
-
-            # A explicit correction
-            first = await remember(ctx, "秋招优先上海")
-            assert first.startswith("已记住"), first
-            second = await remember(ctx, "现在改为优先杭州")
-            assert "已把旧记录标记为失效" in second, second
-
+            # 1. 秋招首选上海 → 找工作更倾向杭州(同属性,不同措辞/城市) → 旧失效
+            chat.set_attr("秋招首选上海", "求职意向城市")
+            await remember(ctx, "秋招首选上海", type="fact")
+            old = (await _active(session, uid))["秋招首选上海"]
+            chat.set_attr("找工作更倾向杭州", "求职意向城市")
+            chat.set_relation("找工作更倾向杭州", [{"candidate_id": str(old.id), "relation": "SUPERSEDE"}])
+            await remember(ctx, "找工作更倾向杭州", type="fact")
             rows = {m.content: m for m in await repo.list_by_user(uid)}
-            old = rows["秋招优先上海"]
-            new = rows["现在改为优先杭州"]
-            assert old.status == "superseded" and old.superseded_by == new.id, "old fact not linked"
-            assert new.status == "active"
-            print("A. explicit update -> superseded + superseded_by ok")
+            assert rows["秋招首选上海"].status == "superseded", rows["秋招首选上海"].status
+            assert rows["秋招首选上海"].superseded_by == rows["找工作更倾向杭州"].id
+            assert rows["找工作更倾向杭州"].status == "active"
+            active = await _active(session, uid)
+            assert "找工作更倾向杭州" in active and "秋招首选上海" not in active
+            print("1. reworded same-attribute supersede ok")
 
-            # B retrieval drops superseded
-            hits = [
-                m.content
-                for m in await search_memories(session, uid, "优先", limit=6, touch=False)
-            ]
-            assert "现在改为优先杭州" in hits and "秋招优先上海" not in hits, hits
-            print("B. retrieval drops superseded ok")
+            # 2. 喜欢篮球 → 也喜欢电影(同属性可并列) → 并存
+            chat.set_attr("喜欢篮球", "兴趣爱好")
+            await remember(ctx, "喜欢篮球", type="fact")
+            chat.set_attr("也喜欢电影", "兴趣爱好")
+            chat.set_relation("也喜欢电影", [])
+            await remember(ctx, "也喜欢电影", type="fact")
+            active = await _active(session, uid)
+            assert {"喜欢篮球", "也喜欢电影"} <= set(active), active
+            print("2. coexisting hobbies ok")
 
-            # C review collects only active facts, change expressed as relation
-            collected = await step_collect_memories(session, uid, {"days": 7}, {})
-            assert collected["status"] == "ok", collected
-            items = collected["data"]["items"]
-            contents = [i["content"] for i in items]
-            assert "现在改为优先杭州" in contents and "秋招优先上海" not in contents, contents
-            assert all(i.get("memory_id") for i in items), "review items missing memory id"
-            changes = collected["data"]["changes"]
-            assert changes and changes[0]["from"] == "秋招优先上海", changes
-            assert changes[0]["to"] == "现在改为优先杭州", changes
-            print("C. review collects active facts + change summary ok")
+            # 3. 喜欢篮球 → 不再喜欢篮球(明确否定) → 旧偏好失效
+            hoops = active["喜欢篮球"]
+            chat.set_attr("不再喜欢篮球", "兴趣爱好")
+            chat.set_relation("不再喜欢篮球", [{"candidate_id": str(hoops.id), "relation": "SUPERSEDE"}])
+            await remember(ctx, "不再喜欢篮球", type="fact")
+            rows = {m.content: m for m in await repo.list_by_user(uid)}
+            assert rows["喜欢篮球"].status == "superseded"
+            assert rows["不再喜欢篮球"].status == "active"
+            print("3. explicit negation supersedes old preference ok")
 
-            # D stale background value no longer injected
-            block = await ChatService(session)._load_profile_block(uid)
-            assert "上海" not in block, block
-            assert "常驻城市" in block and "已被更新的记录取代" in block, block
-            print("D. stale profile value suppressed ok")
+            # 4. 秋招首选杭州 → 常住上海(不同属性) → 并存
+            chat.set_attr("秋招首选杭州", "求职意向城市")
+            await remember(ctx, "秋招首选杭州", type="fact")
+            chat.set_attr("常住上海", "常住城市")
+            chat.set_relation("常住上海", [])
+            await remember(ctx, "常住上海", type="fact")
+            active = await _active(session, uid)
+            assert {"秋招首选杭州", "常住上海"} <= set(active), active
+            print("4. different attributes coexist ok")
 
-            # E two distinct hobbies both kept
-            await remember(ctx, "我喜欢篮球")
-            third = await remember(ctx, "我喜欢电影")
-            assert "已把旧记录标记为失效" not in third, third
-            active = {m.content for m in await repo.list_by_user(uid) if m.status == "active"}
-            assert {"我喜欢篮球", "我喜欢电影"} <= active, active
-            print("E. two distinct hobbies both kept (rule path) ok")
+            # 5. 相同事实重复记住 → 只有一条有效记录
+            before = len(await _active(session, uid))
+            result = await remember(ctx, "常住上海", type="fact")
+            assert "与既有记录一致" in result, result
+            assert len(await _active(session, uid)) == before
+            print("5. exact duplicate reuses single record ok")
 
-            judge = await _borrow_chat_model(session)
-            if judge is None:
-                print("E2. skipped (no chat config to borrow)")
-            else:
-                probe = SimpleNamespace(id=uuid.uuid4(), content="我喜欢游泳", type="fact")
-                marked = await apply_supersede(session, uid, probe, None, model=judge)
-                assert not marked, f"model wrongly superseded one hobby: {marked}"
-                active = {m.content for m in await repo.list_by_user(uid) if m.status == "active"}
-                assert {"我喜欢篮球", "我喜欢电影"} <= active, active
-                print("E2. two distinct hobbies both kept (real model judge) ok")
-
-            # F idempotent duplicate write
-            again = await remember(ctx, "我喜欢电影")
-            assert "未重复保存" in again, again
-            same = [
-                m
-                for m in await repo.list_by_user(uid)
-                if m.status == "active" and m.content == "我喜欢电影"
-            ]
-            assert len(same) == 1, f"duplicate write produced {len(same)} rows"
-            print("F. duplicate write is idempotent ok")
-
-            # G forget only touches the active record
-            removed = await forget(ctx, "优先")
-            assert removed.startswith("已删除记忆"), removed
-            kept = await repo.count_matching(uid, "秋招优先上海", status="superseded")
-            assert kept == 1, "superseded history was deleted"
-            assert await repo.count_matching(uid, "优先杭州") == 0
-            again_forget = await forget(ctx, "优先")
-            assert "没有找到仍有效的记忆" in again_forget, again_forget
-            print("G. forget only touches active memory ok")
-
-            # H credential stays encrypted and out of the review
-            cred = await remember(ctx, "招行银行卡 密码 abc123456", type="credential")
-            assert cred.startswith(("已记住", "已更新")), cred
-            creds = [m for m in await repo.list_by_user(uid) if m.type == "credential"]
-            assert creds and creds[0].content_encrypted, "credential not encrypted"
-            assert "abc123456" not in (creds[0].content or ""), "plaintext in display field"
-            collected = await step_collect_memories(session, uid, {"days": 7}, {})
-            assert all(i["type"] != "credential" for i in collected["data"]["items"])
-            print("H. credential encrypted + excluded from review ok")
-
-            # I 来源溯源:记忆回指当次用户消息,recall 输出带证据;凭证不回指原话
-            conv = await ConversationRepository(session).create(uid, title="trace")
-            msg = await MessageRepository(session).create(
-                conv.id, role="user", content="帮我记住:我下周三面试字节"
+            # 6. 旧记录没有新增属性(向量兜底召回) → 仍可更新
+            vec = [1.0] + [0.0] * 1023
+            legacy = await repo.create(
+                user_id=uid, type="fact", content="秋招想去北京", embedding=vec, attribute=None
             )
-            trace_ctx = ToolContext(session, uid, conv.id, msg.id)
-            saved = await remember(trace_ctx, "我下周三面试字节")
-            assert saved.startswith("已记住"), saved
-            traced = await repo.find_active_by_content(uid, "fact", "我下周三面试字节")
-            assert traced is not None and traced.source == "chat", "来源类型没有落库"
-            assert traced.source_message_id == msg.id, "记忆没有回指当次用户消息"
-            evidence = await recall(trace_ctx, "面试")
-            assert "记忆ID" in evidence and "用户原话" in evidence, evidence
-            assert "下周三面试字节" in evidence and "来源 未知" not in evidence, evidence
-            await remember(trace_ctx, "招行 密码 zzz999888", type="credential")
-            cred_evidence = await recall(trace_ctx, "密码")
-            assert "zzz999888" not in cred_evidence, "recall 泄露了凭证明文"
-            assert "记忆ID" in cred_evidence
-            # 老数据(无来源)如实标注,不伪造用户原话
-            legacy = await repo.create(user_id=uid, type="fact", content="我是 2024 年毕业的")
-            legacy_evidence = await recall(trace_ctx, "毕业")
-            assert "来源 未知" in legacy_evidence, legacy_evidence
-            assert str(legacy.id)[:8] in legacy_evidence
-            print("I. memory source trace + recall evidence ok")
+            embedder.mapping["找工作更想去深圳"] = vec
+            chat.set_relation("找工作更想去深圳", [{"candidate_id": str(legacy.id), "relation": "SUPERSEDE"}])
+            await remember(ctx, "找工作更想去深圳", type="fact")
+            rows = {m.content: m for m in await repo.list_by_user(uid)}
+            assert rows["秋招想去北京"].status == "superseded", "旧无属性记录没被召回/更新"
+            assert rows["秋招想去北京"].superseded_by == rows["找工作更想去深圳"].id
+            print("6. legacy attribute-less record recall + update ok")
 
-            # J ReAct 路径回归:supports_function_call=False 时,工具说明必须渲染进 system prompt
-            # (prepare 里工具构建被移到消息落库之后,这里防止"变量未定义/顺序错"的回归)
-            from app.core.security import encrypt_secret
+            # 7. 多个相关候选,仅一个被明确取代
+            chat.set_attr("想读研", "学业规划")
+            await remember(ctx, "想读研", type="fact")
+            chat.set_attr("想考公", "学业规划")
+            await remember(ctx, "想考公", type="fact")
+            active = await _active(session, uid)
+            chat.set_attr("想直接就业", "学业规划")
+            chat.set_relation(
+                "想直接就业",
+                [
+                    {"candidate_id": str(active["想读研"].id), "relation": "SUPERSEDE"},
+                    {"candidate_id": str(active["想考公"].id), "relation": "COEXIST"},
+                ],
+            )
+            await remember(ctx, "想直接就业", type="fact")
+            rows = {m.content: m for m in await repo.list_by_user(uid)}
+            assert rows["想读研"].status == "superseded"
+            assert rows["想考公"].status == "active"
+            assert rows["想直接就业"].status == "active"
+            print("7. only targeted candidate superseded ok")
 
-            session.add(
-                ModelConfig(
-                    user_id=uid,
-                    model_type="chat",
-                    provider="openai",
-                    model_name="gpt-4o-mini",
-                    api_key_encrypted=encrypt_secret("dummy-key"),
-                    base_url="http://127.0.0.1:9/v1",
-                    supports_function_call=False,
-                    is_default=True,
-                )
-            )
-            await session.commit()
-            react_conv = await ConversationRepository(session).create(uid, title="react path")
-            svc = ChatService(session)
-            _model, react_tools, supports, history, _conv_id = await svc.prepare(
-                react_conv.id, uid, "帮我看看现在几点"
-            )
-            assert supports is False and react_tools, "ReAct 路径没有拿到工具"
-            assert "你有以下工具可用" in history[0].content, "工具说明没有渲染进 system prompt"
-            assert any(getattr(t, "name", "") == "recall" for t in react_tools)
-            print("J. react path renders tools prompt ok")
+            # 8. 模型失败 / 非法 ID / 无法确定 → 旧记录保留,新内容正常保存
+            chat.set_attr("喜欢游泳", "兴趣爱好")
+            await remember(ctx, "喜欢游泳", type="fact")
+            swim = (await _active(session, uid))["喜欢游泳"]
+            # 8a 非法 ID
+            chat.set_attr("喜欢跑步", "兴趣爱好")
+            chat.set_relation("喜欢跑步", [{"candidate_id": "bad-id", "relation": "SUPERSEDE"}])
+            await remember(ctx, "喜欢跑步", type="fact")
+            rows = {m.content: m for m in await repo.list_by_user(uid)}
+            assert rows["喜欢游泳"].status == "active", "非法 ID 不应使旧记录失效"
+            # 8b 模型抛错(失败)
+            chat.set_attr("喜欢骑行", "兴趣爱好")
+            chat.fail_for.add("喜欢骑行")
+            chat.set_relation("喜欢骑行", [{"candidate_id": str(swim.id), "relation": "SUPERSEDE"}])
+            await remember(ctx, "喜欢骑行", type="fact")
+            rows = {m.content: m for m in await repo.list_by_user(uid)}
+            assert rows["喜欢游泳"].status == "active"
+            assert rows["喜欢骑行"].status == "active"
+            # 8c UNCERTAIN
+            chat.fail_for.discard("喜欢骑行")
+            chat.set_attr("喜欢爬山", "兴趣爱好")
+            chat.set_relation("喜欢爬山", [{"candidate_id": str(swim.id), "relation": "UNCERTAIN"}])
+            await remember(ctx, "喜欢爬山", type="fact")
+            rows = {m.content: m for m in await repo.list_by_user(uid)}
+            assert rows["喜欢游泳"].status == "active", "UNCERTAIN 不应使旧记录失效"
+            assert rows["喜欢爬山"].status == "active"
+            print("8. invalid/failed/uncertain keep old records ok")
+
+            # 9. event/todo 不做新旧版本判断:两个不同待办并存
+            await remember(ctx, "明天交周报", type="todo")
+            await remember(ctx, "明天开会", type="todo")
+            active = await _active(session, uid)
+            assert {"明天交周报", "明天开会"} <= set(active), active
+            print("9. event/todo not fact-superseded ok")
         finally:
             await session.execute(delete(User).where(User.id == uid))
             await session.commit()

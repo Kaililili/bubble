@@ -1,6 +1,4 @@
 """记忆工具:save_profile / remember / recall / forget"""
-import re
-
 from pydantic import BaseModel, Field
 
 from ..base import ToolContext, register_tool
@@ -112,8 +110,10 @@ async def remember(ctx: ToolContext, content: str, type: str | None = None) -> s
         embedding = None  # 未配置 embedding 或失败时优雅降级
 
     repo = MemoryRepository(ctx.session)
+    source = "chat" if ctx.message_id else "manual"
+
     if mtype == "credential":
-        # 凭证类 upsert:按归一化应用 key 精准匹配同一凭证,覆盖更新
+        # 凭证类 upsert:按归一化应用 key 精准匹配同一凭证,覆盖更新(不在本次事实更新范围内)
         key = credential_key(content)
         existing = await repo.find_credential_by_key(ctx.user_id, key)
         if existing:
@@ -122,45 +122,62 @@ async def remember(ctx: ToolContext, content: str, type: str | None = None) -> s
             existing.embedding = embedding
             await repo.update(existing)
             return f"已更新凭证:{display_content}"
+        await repo.create(
+            user_id=ctx.user_id,
+            type="credential",
+            content=display_content,
+            content_encrypted=content_encrypted,
+            embedding=embedding,
+            source=source,
+            source_message_id=ctx.message_id,
+        )
+        return f"已记住[credential]:{display_content}"
 
-    # 幂等:同一条事实被重复陈述时复用既有记录,不再堆一条(重复记录会互相干扰检索与回顾)
+    if mtype == "fact":
+        # 普通事实:提取属性 → 混合召回候选 → 逐项判断 → 代码校验写入(单事务)
+        from .....core.agent.memory.supersede import upsert_fact
+
+        outcome, memory, superseded = await upsert_fact(
+            ctx.session,
+            ctx.user_id,
+            display_content,
+            embedding=embedding,
+            source=source,
+            source_message_id=ctx.message_id,
+        )
+        if outcome == "reused":
+            return f"已记住[fact]:{display_content}(与既有记录一致,未重复保存)"
+        if superseded:
+            hint = await _profile_outdated_hint(ctx, superseded, display_content)
+            return (
+                f"已记住[fact]:{display_content}"
+                + "\n(已把旧记录标记为失效: "
+                + " | ".join(superseded[:2])
+                + ")"
+                + hint
+            )
+        return f"已记住[fact]:{display_content}"
+
+    # event / todo:只做"完全相同"幂等,不做新旧版本判断(避免两个不同待办被误判为同一件事)
     same = await repo.find_active_by_content(ctx.user_id, mtype, display_content)
     if same is not None:
         if embedding is not None:
             same.embedding = embedding
-        # 同一条事实再次被用户说起:来源指向最新那次原话,溯源更贴近现实
         if ctx.message_id:
             same.source = "chat"
             same.source_message_id = ctx.message_id
         await repo.update(same)
         return f"已记住[{mtype}]:{display_content}(与既有记录一致,未重复保存)"
 
-    memory = await repo.create(
+    await repo.create(
         user_id=ctx.user_id,
         type=mtype,
         content=display_content,
         content_encrypted=content_encrypted,
         embedding=embedding,
-        source="chat" if ctx.message_id else "manual",
+        source=source,
         source_message_id=ctx.message_id,
     )
-    # 事实时效:新事实可能让旧版本失效(凭证类不参与,它们按 key 覆盖)
-    if mtype != "credential":
-        try:
-            from .....core.agent.memory.supersede import apply_supersede
-
-            marked = await apply_supersede(ctx.session, ctx.user_id, memory, embedding)
-            if marked:
-                hint = await _profile_outdated_hint(ctx, marked, display_content)
-                return (
-                    f"已记住[{mtype}]:{display_content}"
-                    + "\n(已把旧记录标记为失效: "
-                    + " | ".join(marked[:2])
-                    + ")"
-                    + hint
-                )
-        except Exception:  # noqa: BLE001
-            pass
     return f"已记住[{mtype}]:{display_content}"
 
 
@@ -233,9 +250,7 @@ async def forget(ctx: ToolContext, query: str) -> str:
         vector = None
 
     # 只在"仍然有效"的记忆里选目标:被新事实取代的历史记录不该被误删
-    from .....core.agent.memory.supersede import candidate_keywords
-
-    probes = [query, *[p for p in candidate_keywords(query) if p != query]]
+    probes = [query]
     targets: list = []
     seen: set = set()
     for index, probe in enumerate(probes):

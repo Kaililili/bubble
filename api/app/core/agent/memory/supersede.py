@@ -1,247 +1,249 @@
-"""事实时效与失效:让被新事实取代的旧记忆不再干扰回答(不物理删除)。
+"""显式 remember 普通事实的更新引擎。
 
-策略:规则优先,只有"高度相似但不确定是不是同一件事"的歧义对才请 LLM 裁决,
-每次写入最多一次裁决调用,控制成本。
+流程:提取事实属性 → 混合召回候选(属性/向量/文本) → 模型对**每一条候选**批量判断关系
+→ 代码校验后单事务写入(DUPLICATE 复用 / SUPERSEDE 失效 / COEXIST 并存 / 其余保留旧记录)。
+
+思路参照 Mem0(先提取事实再检索旧记忆、模型只能从已召回 ID 里选)与
+Graphiti(候选逐项比较、保留失效历史与来源),但不引入外部依赖、不迁移知识图谱。
 """
+import json
 import logging
 import re
+from uuid import UUID
+
+from ....prompts.memory import FACT_ATTRIBUTE_PROMPT, FACT_RELATION_PROMPT
 
 logger = logging.getLogger(__name__)
-from ....prompts.memory import SUPERSEDE_PROMPT
 
-# 相似到这个程度才值得问模型(否则直接放行,避免无谓调用)
-AMBIGUOUS_SIM = 0.5
+RELATIONS = ("DUPLICATE", "SUPERSEDE", "COEXIST", "UNCERTAIN")
+MAX_CANDIDATES = 6
+
 _SPACE_RE = re.compile(r"\s+")
-
-# 明确更正标记:出现这些词说明用户在主动改口("现在改为…""不再…了")。
-# 只有"同一主题 + 明确改口"才由规则直接判定失效,其余同主题不同值交给模型裁决。
-CORRECTION_MARKERS = (
-    "改为",
-    "改成",
-    "换成",
-    "变更为",
-    "调整为",
-    "更新为",
-    "转成",
-    "变成",
-    "不再",
-    "已经不是",
-    "现在的",
-    "从今天起",
-)
-
 
 
 def normalize_fact(text: str) -> str:
+    """事实文本归一化(去空白),用于"完全相同"的幂等判断"""
     return _SPACE_RE.sub("", (text or "")).strip()
 
 
-def bigram_jaccard(a: str, b: str) -> float:
-    """字符二元组 Jaccard 相似度(中文短句上比词切分更稳)"""
-    na, nb = normalize_fact(a), normalize_fact(b)
-    if not na or not nb:
-        return 0.0
-    if na == nb:
-        return 1.0
-    ga = {na[i:i + 2] for i in range(len(na) - 1)} or {na}
-    gb = {nb[i:i + 2] for i in range(len(nb) - 1)} or {nb}
-    inter = len(ga & gb)
-    union = len(ga | gb)
-    return inter / union if union else 0.0
-
-
-# 槽位关键词:同一类槽位的不同取值(如"住在上海"与"搬到杭州")在字面上几乎不重合,
-# 光靠相似度抓不到,必须靠槽位判断 —— 这类"同一件事换了值"正是最需要失效处理的场景。
-SLOTS = {
-    "居住": ("住在", "搬到", "搬家", "定居", "生活在"),
-    "工作": ("工作", "就职", "入职", "实习", "跳槽", "公司"),
-    "学习": ("在学", "在读", "备考", "考研", "自学"),
-    "偏好": ("喜欢", "最爱", "迷上", "入坑", "习惯"),
-}
-
-# 主题(比槽位更细):同一主题的两个不同取值才谈得上"新旧版本"。
-# 主题只用于"找到候选 + 判定是不是同一个属性",**不因为同主题就直接失效**
-# —— "喜欢篮球"与"喜欢电影"同主题但可以并存,必须由值是否改变/模型裁决决定。
-TOPICS = {
-    "求职城市": (
-        "优先城市", "首选城市", "意向城市", "目标城市", "就业城市", "工作城市",
-        "优先", "首选",
-    ),
-    "居住地": ("住在", "搬到", "搬家", "定居", "生活在", "常住", "常驻"),
-    "工作": ("工作", "任职", "入职", "实习", "跳槽", "就职", "公司"),
-    "学习": ("在学", "在读", "备考", "考研", "自学"),
-    "偏好": ("喜欢", "最爱", "迷上", "入坑", "习惯"),
-}
-
-
-def slot_of(text: str) -> str | None:
-    """这句事实属于哪一类槽位(居住/工作/学习/偏好);判不出返回 None"""
-    value = normalize_fact(text)
-    for slot, keywords in SLOTS.items():
-        if any(word in value for word in keywords):
-            return slot
+def _clean_json(text: str | None) -> dict | None:
+    """从模型输出里抠出 JSON(容忍 ```json 包裹与前后废话)"""
+    if not text:
+        return None
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        stripped = stripped.split("```")[1] if "```" in stripped[3:] else stripped[3:]
+        if stripped.lstrip().lower().startswith("json"):
+            stripped = stripped.lstrip()[4:]
+    for candidate in (
+        stripped,
+        text[text.find("{") : text.rfind("}") + 1] if "{" in text else "",
+    ):
+        if not candidate:
+            continue
+        try:
+            data = json.loads(candidate)
+            if isinstance(data, dict):
+                return data
+        except (ValueError, TypeError):
+            continue
     return None
 
 
-def topic_of(text: str) -> str | None:
-    """这句事实谈的是哪个属性主题(求职城市/居住地/工作/学习/偏好);判不出返回 None"""
-    value = normalize_fact(text)
-    for topic, keywords in TOPICS.items():
-        if any(word in value for word in keywords):
-            return topic
-    return None
+def parse_fact_relations(text: str | None, valid_ids: set[str]) -> dict[str, str]:
+    """解析模型输出的关系;只接受 valid_ids 里的候选,非法 ID / 未知关系一律忽略(默认不失效)"""
+    data = _clean_json(text)
+    if not data:
+        return {}
+    items = data.get("relations")
+    if not isinstance(items, list):
+        return {}
+    out: dict[str, str] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        candidate_id = str(item.get("candidate_id") or "").strip()
+        relation = str(item.get("relation") or "").strip().upper()
+        if candidate_id in valid_ids and relation in RELATIONS:
+            out[candidate_id] = relation
+    return out
 
 
-def has_correction(text: str) -> bool:
-    """是否为"明确更正"口吻(改为/不再/现在的…)"""
-    value = normalize_fact(text)
-    return any(marker in value for marker in CORRECTION_MARKERS)
-
-
-def topic_value(text: str, topic: str | None = None) -> str:
-    """剥掉主题关键词与更正标记后的残余文本:用于判断"同一主题的值是否真的变了"。
-
-    例: topic=求职城市 时 "秋招优先上海" → "秋招上海","现在改为优先杭州" → "现在杭州"。
-    """
-    value = normalize_fact(text)
-    for word in CORRECTION_MARKERS:
-        value = value.replace(word, "")
-    for word in TOPICS.get(topic or "", ()) or ():
-        value = value.replace(word, "")
-    return value
-
-
-def candidate_keywords(text: str, limit: int = 6) -> list[str]:
-    """候选召回探测词:整句 + 命中的主题词/槽位词(长的优先,更精确)。
-
-    只按整句 ILIKE 召回时,"秋招优先上海" 与 "现在改为优先杭州" 互相召回不到,
-    旧事实就可能一直留在 active 里继续被检索。
-    """
-    value = normalize_fact(text)
-    probes: list[str] = [value] if value else []
-    hits: list[str] = []
-    for keywords in (*TOPICS.values(), *SLOTS.values()):
-        for word in keywords:
-            if word in value and word not in hits:
-                hits.append(word)
-    hits.sort(key=len, reverse=True)
-    for word in hits:
-        if len(probes) >= limit:
-            break
-        probes.append(word)
-    return probes
-
-
-def decide_supersede_rules(new_text: str, old_text: str) -> str:
-    """规则判定:supersede(直接失效) / ambiguous(交模型) / keep(互不相干)"""
-    new_norm, old_norm = normalize_fact(new_text), normalize_fact(old_text)
-    if not new_norm or not old_norm:
-        return "keep"
-    if new_norm == old_norm:
-        return "supersede"
-    if old_norm in new_norm or new_norm in old_norm:
-        return "supersede"
-    new_topic, old_topic = topic_of(new_norm), topic_of(old_norm)
-    if new_topic is not None and new_topic == old_topic:
-        # 同一个属性:值没变 = 重复陈述;明确改口 = 规则直接失效;其余不同取值交模型
-        if topic_value(new_norm, new_topic) == topic_value(old_norm, old_topic):
-            return "supersede"
-        if has_correction(new_norm):
-            return "supersede"
-        return "ambiguous"
-    new_slot, old_slot = slot_of(new_norm), slot_of(old_norm)
-    if new_slot is not None and new_slot == old_slot:
-        return "ambiguous"
-    if bigram_jaccard(new_norm, old_norm) >= AMBIGUOUS_SIM:
-        return "ambiguous"
-    return "keep"
-
-
-def is_supersede_answer(text: str) -> bool:
-    value = (text or "").strip().upper()
-    return "SUPERSEDE" in value and "KEEP" not in value.replace("SUPERSEDE", "")
-
-
-async def judge_supersede(model, new_text: str, old_text: str) -> bool:
-    """歧义对交模型裁决;失败按不失效处理(保守,不误杀记忆)"""
+async def _invoke(model, prompt: str) -> str | None:
     from langchain_core.messages import HumanMessage
 
-    prompt = SUPERSEDE_PROMPT + "\n旧:" + old_text + "\n新:" + new_text
     try:
         result = await model.ainvoke([HumanMessage(content=prompt)])
         content = getattr(result, "content", result)
-        return is_supersede_answer(content if isinstance(content, str) else str(content))
+        return content if isinstance(content, str) else str(content)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("supersede judge failed: %s", exc)
-        return False
+        logger.warning("fact update model call failed: %s", exc)
+        return None
 
 
-async def apply_supersede(session, user_id, new_memory, embedding=None, model=None) -> list:
-    """把被新事实取代的旧记忆标记为 superseded;返回被标记的旧内容列表"""
-    from app.repositories.memory_repository import MemoryRepository
+async def _build_model(session, user_id):
+    from app.core.llm.client import build_chat_model
+    from app.core.llm.resolver import get_default_config
 
-    repo = MemoryRepository(session)
-    candidates = await _discover_candidates(repo, user_id, new_memory, embedding)
-    marked = []
-    judged = False
-    for old, _sim in candidates:
-        if old.id == new_memory.id or old.type != new_memory.type:
-            continue
-        action = decide_supersede_rules(new_memory.content, old.content)
-        if action == "keep":
-            continue
-        if action == "ambiguous":
-            if judged:
-                continue
-            judged = True
-            if model is None:
-                model = await _build_judge(session, user_id)
-            if model is None or not await judge_supersede(model, new_memory.content, old.content):
-                continue
-        try:
-            await repo.supersede(old, new_memory.id)
-            marked.append(old.content)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("mark superseded failed: %s", exc)
-    return marked
-
-
-async def _discover_candidates(repo, user_id, new_memory, embedding=None) -> list:
-    """候选发现:向量 + 整句 + 主题词/槽位词多路探测,去重后按相似度保留。
-
-    只按整句关键词召回会漏掉"换了取值"的旧事实(如"秋招优先上海" vs "现在改为优先杭州"),
-    多路探测能把它们捞回来,交给规则/模型判定;探测次数固定(≤6),不会全表扫描。
-    """
-    probes = candidate_keywords(new_memory.content or "")
-    if not probes:
-        return []
-    pool: dict = {}
-    for index, probe in enumerate(probes):
-        try:
-            rows = await repo.search_candidates(
-                user_id,
-                embedding if index == 0 else None,
-                probe,
-                limit=5,
-                include_superseded=False,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("supersede candidates failed: %s", exc)
-            continue
-        for memory, similarity in rows:
-            current = pool.get(memory.id)
-            if current is None or (similarity or 0.0) > (current[1] or 0.0):
-                pool[memory.id] = (memory, similarity)
-    return list(pool.values())
-
-
-async def _build_judge(session, user_id):
     try:
-        from app.core.llm.client import build_chat_model
-        from app.core.llm.resolver import get_default_config
-
         config = await get_default_config(session, user_id, "chat")
         return build_chat_model(config, streaming=False, temperature=0)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("build supersede judge failed: %s", exc)
+        logger.warning("build fact update model failed: %s", exc)
         return None
+
+
+async def extract_fact_attribute(session, user_id, content, model=None) -> tuple[str | None, str | None]:
+    """模型提取规范化"事实属性"与可选"适用范围";失败/不可靠返回 (None, None)"""
+    if model is None:
+        model = await _build_model(session, user_id)
+    if model is None:
+        return None, None
+    raw = await _invoke(model, FACT_ATTRIBUTE_PROMPT.format(content=content))
+    data = _clean_json(raw)
+    if not data:
+        return None, None
+    attribute = (str(data.get("attribute") or "")).strip()[:50] or None
+    scope = (str(data.get("scope") or "")).strip()[:100] or None
+    return attribute, scope
+
+
+async def judge_fact_relations(
+    session,
+    user_id,
+    new_content,
+    attribute,
+    scope,
+    candidates,
+    model=None,
+) -> dict[str, str]:
+    """模型对每条候选批量判断关系;失败/非法输出时返回空(即全部保留旧记录)"""
+    if not candidates:
+        return {}
+    if model is None:
+        model = await _build_model(session, user_id)
+    if model is None:
+        return {}
+    cand_desc = [
+        {
+            "id": str(c.id),
+            "content": c.content,
+            "attribute": getattr(c, "attribute", None),
+            "scope": getattr(c, "scope", None),
+            "created_at": c.created_at.isoformat() if c.created_at else None,
+        }
+        for c in candidates
+    ]
+    prompt = FACT_RELATION_PROMPT.format(
+        content=new_content,
+        attribute=attribute or "",
+        scope=scope or "",
+        candidates=json.dumps(cand_desc, ensure_ascii=False),
+    )
+    raw = await _invoke(model, prompt)
+    return parse_fact_relations(raw, {str(c.id) for c in candidates})
+
+
+async def upsert_fact(
+    session,
+    user_id: UUID,
+    content: str,
+    *,
+    embedding=None,
+    source: str | None = None,
+    source_message_id: UUID | None = None,
+    model=None,
+) -> tuple[str, object, list[str]]:
+    """显式 remember 普通事实:一次事务内完成 去重/候选/判断/写入。
+
+    返回 (outcome, memory, superseded_contents);outcome 为 'reused' 或 'created'。
+    """
+    from app.repositories.memory_repository import MemoryRepository
+
+    repo = MemoryRepository(session)
+
+    # 1. 完全相同(归一化后一致)的现行事实 → 复用,不新增第二条
+    same = await repo.find_active_by_content(user_id, "fact", content)
+    if same is not None:
+        if embedding is not None:
+            same.embedding = embedding
+        if source_message_id:
+            same.source = source
+            same.source_message_id = source_message_id
+        await repo.update(same)
+        return "reused", same, []
+
+    # 2. 提取属性(尽力而为;旧记录没有属性时靠向量/文本兜底召回)
+    attribute, scope = await extract_fact_attribute(session, user_id, content, model)
+
+    # 3. 混合召回候选(同用户、同类型、active)
+    candidates = await repo.find_update_candidates(
+        user_id, "fact", attribute, scope, embedding, content, limit=MAX_CANDIDATES
+    )
+
+    # 4. 批量判断(模型只提关系,代码校验;失败→空→全部保留)
+    relations = await judge_fact_relations(
+        session, user_id, content, attribute, scope, candidates, model
+    )
+
+    # 5. DUPLICATE → 复用旧记录(不新增)
+    candidate_by_id = {str(c.id): c for c in candidates}
+    for candidate_id, relation in relations.items():
+        if relation != "DUPLICATE":
+            continue
+        old = candidate_by_id.get(candidate_id)
+        if (
+            old is not None
+            and old.user_id == user_id
+            and old.type == "fact"
+            and old.status == "active"
+        ):
+            if embedding is not None:
+                old.embedding = embedding
+            if source_message_id:
+                old.source = source
+                old.source_message_id = source_message_id
+            await repo.update(old)
+            return "reused", old, []
+
+    # 6. 创建新记忆(先 flush 拿 id,不 commit)
+    new = await repo.insert_fact(
+        user_id=user_id,
+        content=content,
+        embedding=embedding,
+        source=source,
+        source_message_id=source_message_id,
+        attribute=attribute,
+        scope=scope,
+    )
+
+    # 7. 应用 SUPERSEDE(逐条校验归属/类型/仍有效后标记;最后单事务提交)
+    superseded_contents: list[str] = []
+    for candidate_id, relation in relations.items():
+        if relation != "SUPERSEDE":
+            continue
+        old = candidate_by_id.get(candidate_id)
+        if (
+            old is None
+            or old.user_id != user_id
+            or old.type != "fact"
+            or old.status != "active"
+        ):
+            continue
+        old.status = "superseded"
+        old.superseded_by = new.id
+        superseded_contents.append(old.content)
+
+    await session.commit()
+    return "created", new, superseded_contents
+
+
+__all__ = [
+    "RELATIONS",
+    "MAX_CANDIDATES",
+    "normalize_fact",
+    "parse_fact_relations",
+    "extract_fact_attribute",
+    "judge_fact_relations",
+    "upsert_fact",
+]
